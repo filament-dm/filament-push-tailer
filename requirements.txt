@@ -1,0 +1,2 @@
+# filament agent listen — runtime deps
+firebase-messaging>=0.4

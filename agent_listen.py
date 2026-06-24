@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""filament agent listen — a generic Claude Code wake sidecar.
+
+Run this wherever your agent lives. It holds a persistent FCM connection,
+and on each relevant push from Filament it spawns a *fresh, scoped*
+``claude -p`` that reads and acts through your agent's MCP tools, then
+exits. No long-lived context window; all state materializes back in
+Filament.
+
+This is the CC analogue of the Hermes gateway (hermes-filament-fcm).
+Genericized from lord-gnomington's ``scripts/fcm_listen.py`` (FCM intake +
+push parsing + token registration) and ``scripts/watch.py`` (the
+``claude -p`` trigger). Tracked by ENG-155.
+
+Pipeline:  Firebase register -> FCM token -> register_push_token (MCP) ->
+           heartbeat loop (keeps "Connected" green) ->
+           listen -> per push: ping->pong, or relevant message->claude -p.
+
+The Filament agent surface has three shapes, all on one bearer token:
+  * MCP tools          POST {homeserver}/mcp/agents  (JSON-RPC tools/call).
+                       Stateless, plain JSON, no initialize handshake. Used
+                       for register_push_token / get_self and, inside the
+                       woken claude, for reading + posting.
+  * Pong side-channel  POST {homeserver}/mcp/agents/pong   {"nonce": ...}.
+  * Heartbeat          POST {homeserver}/mcp/agents/heartbeat   (no body).
+pong + heartbeat are deliberately NOT MCP tools — they are harness plumbing
+and never routed through the LLM.
+
+Config (env, or a .env beside this file; env wins):
+  FILAMENT_CONNECT_TOKEN   the fmcp_ connect token from the Filament app
+                           connect flow (REQUIRED) — the agent's MCP bearer.
+  FILAMENT_HOMESERVER      e.g. https://api.filament.dm (REQUIRED).
+  FILAMENT_ALLOWED_TOOLS   tool allow-list for the woken claude; default
+                           "mcp__filament__*" (the Filament tools only, no
+                           general-purpose Bash/file access).
+  FILAMENT_SYSTEM_PROMPT   extra system prompt appended for the woken claude
+                           (its persona / house rules). Optional.
+  FILAMENT_CLAUDE_MODEL    model alias for the woken claude (optional).
+  FILAMENT_PUSH_PLATFORM   android | macos | ios; default android.
+  FILAMENT_FIREBASE_*      Firebase project config (public; defaults baked
+                           in — same values as the other Filament clients).
+
+Dependency:  pip install firebase-messaging
+State:  state/fcm-credentials.json (FCM creds), state/seen.json (dedup),
+        state/mcp.json (generated MCP config handed to the woken claude).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = os.path.join(ROOT, "state")
+CREDS = os.path.join(STATE_DIR, "fcm-credentials.json")
+SEEN = os.path.join(STATE_DIR, "seen.json")
+MCP_CONFIG = os.path.join(STATE_DIR, "mcp.json")
+
+# Filament's Firebase project — public config (same values the Electron /
+# mobile clients and the hermes-filament-fcm adapter use). Override via env.
+FIREBASE_DEFAULTS = {
+    "project_id": "filament-8ce44",
+    "app_id": "1:143821144946:web:90e517a7f36aa42a6093eb",
+    "api_key": "AIzaSyBtYzzP3IRpmIZ57dp1PMS4Y8RPjTB0snk",
+    "sender_id": "143821144946",
+}
+
+# Heartbeat cadence. Any authenticated traffic marks the agent's Matrix
+# presence online and decays when we stop, so this is what makes the
+# principal's status dot reflect "this sidecar is actually up".
+HEARTBEAT_SECONDS = 240
+
+
+def env(key: str, default: str | None = None, required: bool = False) -> str:
+    val = os.environ.get(key, default)
+    if required and not val:
+        sys.exit(f"agent_listen: missing required env {key}")
+    return val or ""
+
+
+def _load_dotenv() -> None:
+    """Load a .env beside this file. Real env vars always win."""
+    path = os.path.join(ROOT, ".env")
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv()
+
+CONNECT_TOKEN = env("FILAMENT_CONNECT_TOKEN", required=True)
+HOMESERVER = env("FILAMENT_HOMESERVER", required=True).rstrip("/")
+ALLOWED_TOOLS = env("FILAMENT_ALLOWED_TOOLS", "mcp__filament__*")
+SYSTEM_PROMPT_EXTRA = env("FILAMENT_SYSTEM_PROMPT")
+CLAUDE_MODEL = env("FILAMENT_CLAUDE_MODEL")
+PLATFORM = env("FILAMENT_PUSH_PLATFORM", "android")
+
+
+def _firebase(key: str) -> str:
+    return env(f"FILAMENT_FIREBASE_{key.upper()}") or FIREBASE_DEFAULTS[key]
+
+
+# ---------------------------------------------------------------- Filament client
+
+class FilamentError(Exception):
+    """A non-2xx HTTP status or a JSON-RPC error from the agent surface."""
+
+
+class FilamentClient:
+    """Bearer-authenticated client for the agent surface (stdlib only).
+
+    The connect token is an ``fmcp_`` bearer scoped to this agent. The MCP
+    endpoint is stateless and returns plain JSON, so no ``initialize``
+    handshake or session header is needed — every request stands alone.
+    """
+
+    def __init__(self, homeserver: str, token: str) -> None:
+        self._base = homeserver
+        self._token = token
+        self._id = 0
+
+    def _post(self, path: str, payload: dict | None) -> dict:
+        data = json.dumps(payload).encode() if payload is not None else b""
+        req = urllib.request.Request(
+            f"{self._base}{path}",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode() or "{}"
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:300]
+            raise FilamentError(f"{path} -> HTTP {e.code}: {body}") from e
+        return json.loads(raw) if raw.strip() else {}
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        """Invoke an MCP tool and return its (unwrapped) result dict.
+
+        The endpoint wraps tool output as
+        ``{"result": {"content": [{"type": "text", "text": "<json>"}]}}``;
+        a tool/transport failure comes back as a JSON-RPC ``error``.
+        """
+        self._id += 1
+        resp = self._post(
+            "/mcp/agents",
+            {
+                "jsonrpc": "2.0",
+                "id": self._id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+        if "error" in resp:
+            raise FilamentError(f"{name}: {resp['error']}")
+        content = (resp.get("result") or {}).get("content") or []
+        for block in content:
+            if block.get("type") == "text":
+                try:
+                    return json.loads(block["text"])
+                except (ValueError, KeyError):
+                    return {"text": block.get("text", "")}
+        return {}
+
+    def register_push_token(self, token: str, platform: str) -> dict:
+        return self.call_tool(
+            "register_push_token", {"token": token, "platform": platform}
+        )
+
+    def get_self(self) -> dict:
+        return self.call_tool("get_self", {})
+
+    def pong(self, nonce: str | None) -> None:
+        # Side-channel REST endpoint — proves synapse -> FCM -> here -> back,
+        # which is what flips push_round_trip_ok on the principal's detail read.
+        self._post("/mcp/agents/pong", {"nonce": nonce})
+
+    def heartbeat(self) -> None:
+        # Side-channel REST endpoint — keeps Matrix presence online.
+        self._post("/mcp/agents/heartbeat", None)
+
+
+client = FilamentClient(HOMESERVER, CONNECT_TOKEN)
+
+# The agent's C&C backchannel room, learned from get_self at startup. Messages
+# here always wake the agent (the room is not flagged is_direct in pushes).
+BACKCHANNEL_ROOM_ID: str | None = None
+
+
+# ---------------------------------------------------------------- dedup state
+
+def _load_seen() -> set[str]:
+    try:
+        return set(json.load(open(SEEN)))
+    except (OSError, ValueError):
+        return set()
+
+
+def _mark_seen(seen: set[str], pid: str) -> None:
+    seen.add(pid)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    # Bound the file; recent ids are all that matter for dedup.
+    json.dump(list(seen)[-500:], open(SEEN, "w"))
+
+
+# ---------------------------------------------------------------- push parsing
+
+def _parse_body(data: dict) -> dict | None:
+    """Pull the JSON ``PushPayload`` out of a DirectPusher FCM data message.
+
+    Both liveness pings and room events arrive with their real payload in a
+    ``body`` field (a JSON string). Returns the decoded dict, or None.
+    """
+    inner = data.get("data", data) if isinstance(data, dict) else {}
+    body_json = inner.get("body") if isinstance(inner, dict) else None
+    if not body_json:
+        return None
+    try:
+        payload = json.loads(body_json)
+    except (ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def summarize_message(payload: dict) -> dict:
+    """Flatten a room-event PushPayload into a friendly summary.
+
+    Lifted from lord-gnomington/fcm_listen.py. The payload carries
+    ``room_id``, ``event_id``, ``is_direct``, and a ``branch`` with
+    type/sender/channel/content.text/thread_id + routing flags.
+    """
+    branch = payload.get("branch") or {}
+    content = branch.get("content") if isinstance(branch.get("content"), dict) else {}
+    return {
+        "branch_type": branch.get("type", ""),
+        "room_id": payload.get("room_id", ""),
+        "room_name": branch.get("channel", branch.get("sender", "")),
+        "sender": branch.get("sender", ""),
+        "sender_id": branch.get("sender_id", ""),
+        "is_direct": payload.get("is_direct", False),
+        "thread_id": branch.get("thread_id"),
+        "is_mention": branch.get("is_mention_of_recipient", False),
+        "is_everyone_mention": branch.get("is_everyone_mention", False),
+        "is_reply_to_recipient": branch.get("is_reply_to_recipient", False),
+        "is_from_self": branch.get("is_from_self", False),
+        "event_id": payload.get("event_id", ""),
+        "text": content.get("text") or content.get("body") or branch.get("body") or "",
+    }
+
+
+def is_relevant(summary: dict) -> bool:
+    """Should a push wake the agent?
+
+    Always answer in the **backchannel** (the agent's C&C room with its
+    principal — matched by room id, since that room is NOT flagged
+    ``is_direct`` in the push payload) or any other direct conversation;
+    elsewhere only on a direct address. Never wake on the agent's own events.
+
+    TODO: tighten with sender-classification flags (ENG-218).
+    """
+    if summary.get("is_from_self"):
+        return False
+    if BACKCHANNEL_ROOM_ID and summary.get("room_id") == BACKCHANNEL_ROOM_ID:
+        return True
+    if summary.get("is_direct"):  # DM with the principal
+        return True
+    return bool(
+        summary.get("is_mention")
+        or summary.get("is_everyone_mention")
+        or summary.get("is_reply_to_recipient")
+    )
+
+
+# ---------------------------------------------------------------- claude -p trigger
+
+def write_mcp_config() -> None:
+    """Generate the MCP config the woken claude loads with --mcp-config.
+
+    Registers the Filament agent surface as an HTTP MCP server named
+    ``filament``, so its tools appear to claude as ``mcp__filament__*``. The
+    bearer lives only in this gitignored state file, never in the repo.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    config = {
+        "mcpServers": {
+            "filament": {
+                "type": "http",
+                "url": f"{HOMESERVER}/mcp/agents",
+                "headers": {"Authorization": f"Bearer {CONNECT_TOKEN}"},
+            }
+        }
+    }
+    with open(MCP_CONFIG, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+_BASE_SYSTEM_PROMPT = (
+    "You are a Filament agent reacting to a single inbound event. You act "
+    "exclusively through the `mcp__filament__*` tools (server `filament`): "
+    "read context with get_recent_messages / get_thread / get_user_profile, "
+    "then respond in the place the event came from — reply_in_thread when "
+    "there is a thread_id, otherwise post_message to the room_id. Be concise, "
+    "do the one thing the event calls for, then stop. Do not introduce "
+    "yourself unless asked."
+)
+
+
+def build_prompt(summary: dict) -> str:
+    """The user-turn prompt: describe the event and where to answer."""
+    where = "thread" if summary.get("thread_id") else "channel"
+    lines = [
+        "A new message just arrived in Filament. Decide whether and how to "
+        "respond, then act via the filament tools.",
+        "",
+        f"room_id: {summary.get('room_id')}",
+        f"event_id: {summary.get('event_id')}",
+        f"reply target: {where}",
+    ]
+    if summary.get("thread_id"):
+        lines.append(f"thread_id: {summary.get('thread_id')}")
+    lines += [
+        f"from: {summary.get('sender') or summary.get('sender_id')}",
+        f"is_direct: {summary.get('is_direct')}",
+        "",
+        "message:",
+        (summary.get("text") or "").strip() or "(no text body)",
+    ]
+    return "\n".join(lines)
+
+
+def fire_trigger(summary: dict) -> None:
+    """Spawn a fresh, scoped ``claude -p`` for one event.
+
+    Adapted from lord-gnomington/watch.py ``fire_trigger``: the event is fed
+    as the prompt, the agent acts through its Filament MCP tools under an
+    explicit allow-list, and exits. State lives in Filament, not in a
+    long-lived context. --strict-mcp-config keeps the run to *only* the
+    Filament server (none of the host's personal MCP servers).
+    """
+    system_prompt = _BASE_SYSTEM_PROMPT
+    if SYSTEM_PROMPT_EXTRA:
+        system_prompt = f"{system_prompt}\n\n{SYSTEM_PROMPT_EXTRA}"
+
+    cmd = [
+        "claude",
+        "-p",
+        build_prompt(summary),
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--mcp-config",
+        MCP_CONFIG,
+        "--strict-mcp-config",
+        "--allowed-tools",
+        ALLOWED_TOOLS,
+        "--append-system-prompt",
+        system_prompt,
+    ]
+    if CLAUDE_MODEL:
+        cmd += ["--model", CLAUDE_MODEL]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        sys.exit("agent_listen: `claude` not on PATH — install the Claude Code CLI")
+    # Stream the woken claude's output through so the operator can watch it work.
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stdout.write(f"  claude| {line}")
+    proc.wait()
+
+
+# ---------------------------------------------------------------- push handler
+
+_seen: set[str] = set()
+
+
+def on_push(data, persistent_id, _obj=None) -> None:
+    """firebase-messaging callback — fires on every received push."""
+    payload = _parse_body(data)
+    if payload is None:
+        inner = data.get("data", data) if isinstance(data, dict) else {}
+        keys = list(inner) if isinstance(inner, dict) else type(inner).__name__
+        print(f"agent_listen: push with no parseable body (keys={keys})")
+        return
+
+    # (a) Liveness ping -> pong, nothing else. This is what makes the
+    # principal-side "Connected" real (push_round_trip_ok): it proves
+    # Filament can wake us end to end. Mirrors the Hermes gateway.
+    if payload.get("type") == "io.filament.ping":
+        nonce = payload.get("nonce")
+        try:
+            client.pong(nonce)
+            print(f"agent_listen: pong (nonce={nonce})")
+        except Exception as e:  # noqa: BLE001 — never let pong crash the loop
+            print(f"agent_listen: pong failed: {e}")
+        return
+
+    # (b) Real activity -> a fresh scoped claude -p.
+    summary = summarize_message(payload)
+    relevant = is_relevant(summary)
+    print(
+        f"agent_listen: message push — direct={summary.get('is_direct')} "
+        f"mention={summary.get('is_mention')} reply={summary.get('is_reply_to_recipient')} "
+        f"from_self={summary.get('is_from_self')} relevant={relevant} "
+        f"text={(summary.get('text') or '')[:40]!r}"
+    )
+    if not relevant:
+        return
+    if persistent_id in _seen:
+        return
+    _mark_seen(_seen, persistent_id)
+    where = summary["room_name"] or summary["room_id"]
+    print(f"agent_listen: wake — {summary['branch_type']} in {where!r}")
+    try:
+        fire_trigger(summary)
+    except Exception as e:  # noqa: BLE001 — one bad event must not kill the loop
+        print(f"agent_listen: trigger failed: {e}")
+
+
+# ---------------------------------------------------------------- heartbeat
+
+def _heartbeat_loop(stop: threading.Event) -> None:
+    """Keep the agent's presence online while the sidecar runs."""
+    while not stop.wait(HEARTBEAT_SECONDS):
+        try:
+            client.heartbeat()
+            print("agent_listen: heartbeat")
+        except Exception as e:  # noqa: BLE001
+            print(f"agent_listen: heartbeat failed: {e}")
+
+
+# ---------------------------------------------------------------- FCM register + run
+
+async def _fcm_register():
+    try:
+        from firebase_messaging import FcmPushClient, FcmRegisterConfig
+    except ImportError:
+        sys.exit("agent_listen: missing dep — run: pip install firebase-messaging")
+
+    def _load_creds():
+        try:
+            return json.load(open(CREDS))
+        except (OSError, ValueError):
+            return None
+
+    def _save_creds(creds):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        json.dump(creds, open(CREDS, "w"), indent=2)
+
+    config = FcmRegisterConfig(
+        _firebase("project_id"),
+        _firebase("app_id"),
+        _firebase("api_key"),
+        _firebase("sender_id"),
+    )
+    # A *fresh* GCM registration is flaky — Google intermittently returns
+    # PHONE_REGISTRATION_ERROR, and the library only retries twice internally.
+    # Retry with backoff; once it succeeds the creds are cached, so subsequent
+    # runs skip registration entirely.
+    creds = _load_creds()
+    last_err: object = None
+    for attempt in range(1, 7):
+        fcm = FcmPushClient(
+            callback=on_push,
+            fcm_config=config,
+            credentials=creds,
+            credentials_updated_callback=_save_creds,
+        )
+        try:
+            token = await fcm.checkin_or_register()
+        except Exception as e:  # noqa: BLE001 — GCM register is flaky
+            last_err = e
+        else:
+            if token:
+                return fcm, token
+            last_err = "registration returned no token"
+        print(
+            f"agent_listen: FCM registration attempt {attempt} failed "
+            f"({last_err}); retrying…"
+        )
+        await asyncio.sleep(min(4 * attempt, 20))
+    sys.exit(f"agent_listen: FCM registration failed after retries — {last_err}")
+
+
+async def run() -> None:
+    global _seen
+    _seen = _load_seen()
+
+    # Identify ourselves up front — a clear failure here means a bad token or
+    # homeserver, caught before we wait on pushes.
+    try:
+        me = client.get_self()
+        print(f"agent_listen: connected as {me.get('user_id') or me}")
+    except FilamentError as e:
+        sys.exit(f"agent_listen: could not reach the agent surface — {e}")
+
+    global BACKCHANNEL_ROOM_ID
+    BACKCHANNEL_ROOM_ID = me.get("cc_room_id") if isinstance(me, dict) else None
+    print(f"agent_listen: backchannel = {BACKCHANNEL_ROOM_ID}")
+
+    write_mcp_config()
+
+    fcm, fcm_token = await _fcm_register()
+    print(f"agent_listen: FCM token = {fcm_token[:24]}…")
+
+    # Register the token with Filament so DirectPusher routes pushes here.
+    result = client.register_push_token(fcm_token, PLATFORM)
+    if not result.get("success"):
+        sys.exit(f"agent_listen: register_push_token failed — {result}")
+    print(f"agent_listen: registered with Filament (platform={PLATFORM})")
+
+    stop = threading.Event()
+    threading.Thread(target=_heartbeat_loop, args=(stop,), daemon=True).start()
+
+    print(f"agent_listen: listening — tools={ALLOWED_TOOLS!r}. Ctrl-C to stop.")
+    await fcm.start()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        stop.set()
+
+
+def main() -> None:
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print(f"\nagent_listen: stopped ({time.strftime('%H:%M:%S')})")
+
+
+if __name__ == "__main__":
+    main()
