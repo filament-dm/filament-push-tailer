@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-"""filament agent listen — a generic Claude Code wake sidecar.
+"""filament push tailer — register for Filament pushes, tail them to a file.
 
-Run this wherever your agent lives. It holds a persistent FCM connection,
-and on each relevant push from Filament it spawns a *fresh, scoped*
-``claude -p`` that reads and acts through your agent's MCP tools, then
-exits. No long-lived context window; all state materializes back in
-Filament.
+Run this wherever your agent lives. It holds a persistent FCM connection and,
+on each relevant push from Filament, appends the event to ``state/inbox.jsonl``.
+It does NOT spawn anything or decide how to respond — your own Claude Code
+session tails the inbox (e.g. via the Monitor tool, see the bundled skill) and
+handles each event however you like, with full session continuity. The tailer
+is dumb plumbing; the behaviour lives in your session.
 
-This is the CC analogue of the Hermes gateway (hermes-filament-fcm).
-Genericized from lord-gnomington's ``scripts/fcm_listen.py`` (FCM intake +
-push parsing + token registration) and ``scripts/watch.py`` (the
-``claude -p`` trigger). Tracked by ENG-155.
+This is the listen half of the Filament agent loop. It rides the same FCM /
+DirectPusher transport as the Hermes gateway (hermes-filament-fcm). Genericized
+from lord-gnomington's ``scripts/fcm_listen.py`` (FCM intake + push parsing +
+token registration). Tracked by ENG-155.
 
 Pipeline:  Firebase register -> FCM token -> register_push_token (MCP) ->
            heartbeat loop (keeps "Connected" green) ->
-           listen -> per push: ping->pong, or relevant message->claude -p.
+           listen -> per push: ping->pong, or relevant message->append to inbox.
 
 The Filament agent surface has three shapes, all on one bearer token:
   * MCP tools          POST {homeserver}/mcp/agents  (JSON-RPC tools/call).
                        Stateless, plain JSON, no initialize handshake. Used
-                       for register_push_token / get_self and, inside the
-                       woken claude, for reading + posting.
+                       here for register_push_token / get_self; your session
+                       uses the same server (state/mcp.json) to read + post.
   * Pong side-channel  POST {homeserver}/mcp/agents/pong   {"nonce": ...}.
   * Heartbeat          POST {homeserver}/mcp/agents/heartbeat   (no body).
 pong + heartbeat are deliberately NOT MCP tools — they are harness plumbing
@@ -30,19 +31,14 @@ Config (env, or a .env beside this file; env wins):
   FILAMENT_CONNECT_TOKEN   the fmcp_ connect token from the Filament app
                            connect flow (REQUIRED) — the agent's MCP bearer.
   FILAMENT_HOMESERVER      e.g. https://api.filament.dm (REQUIRED).
-  FILAMENT_ALLOWED_TOOLS   tool allow-list for the woken claude; default
-                           "mcp__filament__*" (the Filament tools only, no
-                           general-purpose Bash/file access).
-  FILAMENT_SYSTEM_PROMPT   extra system prompt appended for the woken claude
-                           (its persona / house rules). Optional.
-  FILAMENT_CLAUDE_MODEL    model alias for the woken claude (optional).
   FILAMENT_PUSH_PLATFORM   android | macos | ios; default android.
   FILAMENT_FIREBASE_*      Firebase project config (public; defaults baked
                            in — same values as the other Filament clients).
 
 Dependency:  pip install firebase-messaging
 State:  state/fcm-credentials.json (FCM creds), state/seen.json (dedup),
-        state/mcp.json (generated MCP config handed to the woken claude).
+        state/mcp.json (the Filament MCP server config for your session),
+        state/inbox.jsonl (the append-only event feed your session tails).
 """
 
 from __future__ import annotations
@@ -50,7 +46,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -62,6 +57,7 @@ STATE_DIR = os.path.join(ROOT, "state")
 CREDS = os.path.join(STATE_DIR, "fcm-credentials.json")
 SEEN = os.path.join(STATE_DIR, "seen.json")
 MCP_CONFIG = os.path.join(STATE_DIR, "mcp.json")
+INBOX = os.path.join(STATE_DIR, "inbox.jsonl")
 
 # Filament's Firebase project — public config (same values the Electron /
 # mobile clients and the hermes-filament-fcm adapter use). Override via env.
@@ -105,9 +101,6 @@ _load_dotenv()
 
 CONNECT_TOKEN = env("FILAMENT_CONNECT_TOKEN", required=True)
 HOMESERVER = env("FILAMENT_HOMESERVER", required=True).rstrip("/")
-ALLOWED_TOOLS = env("FILAMENT_ALLOWED_TOOLS", "mcp__filament__*")
-SYSTEM_PROMPT_EXTRA = env("FILAMENT_SYSTEM_PROMPT")
-CLAUDE_MODEL = env("FILAMENT_CLAUDE_MODEL")
 PLATFORM = env("FILAMENT_PUSH_PLATFORM", "android")
 
 
@@ -291,14 +284,16 @@ def is_relevant(summary: dict) -> bool:
     )
 
 
-# ---------------------------------------------------------------- claude -p trigger
+# ---------------------------------------------------------------- inbox + MCP config
 
 def write_mcp_config() -> None:
-    """Generate the MCP config the woken claude loads with --mcp-config.
+    """Generate the Filament MCP server config for your Claude Code session.
 
     Registers the Filament agent surface as an HTTP MCP server named
-    ``filament``, so its tools appear to claude as ``mcp__filament__*``. The
-    bearer lives only in this gitignored state file, never in the repo.
+    ``filament``, so its tools appear to claude as ``mcp__filament__*``. Point
+    your session at it with ``claude --mcp-config state/mcp.json`` (or
+    ``claude mcp add``). The bearer lives only in this gitignored state file,
+    never in the repo.
     """
     os.makedirs(STATE_DIR, exist_ok=True)
     config = {
@@ -314,85 +309,19 @@ def write_mcp_config() -> None:
         json.dump(config, f, indent=2)
 
 
-_BASE_SYSTEM_PROMPT = (
-    "You are a Filament agent reacting to a single inbound event. You act "
-    "exclusively through the `mcp__filament__*` tools (server `filament`): "
-    "read context with get_recent_messages / get_thread / get_user_profile, "
-    "then respond in the place the event came from — reply_in_thread when "
-    "there is a thread_id, otherwise post_message to the room_id. Be concise, "
-    "do the one thing the event calls for, then stop. Do not introduce "
-    "yourself unless asked."
-)
+def append_to_inbox(summary: dict) -> None:
+    """Append one event to the inbox feed your session tails.
 
-
-def build_prompt(summary: dict) -> str:
-    """The user-turn prompt: describe the event and where to answer."""
-    where = "thread" if summary.get("thread_id") else "channel"
-    lines = [
-        "A new message just arrived in Filament. Decide whether and how to "
-        "respond, then act via the filament tools.",
-        "",
-        f"room_id: {summary.get('room_id')}",
-        f"event_id: {summary.get('event_id')}",
-        f"reply target: {where}",
-    ]
-    if summary.get("thread_id"):
-        lines.append(f"thread_id: {summary.get('thread_id')}")
-    lines += [
-        f"from: {summary.get('sender') or summary.get('sender_id')}",
-        f"is_direct: {summary.get('is_direct')}",
-        "",
-        "message:",
-        (summary.get("text") or "").strip() or "(no text body)",
-    ]
-    return "\n".join(lines)
-
-
-def fire_trigger(summary: dict) -> None:
-    """Spawn a fresh, scoped ``claude -p`` for one event.
-
-    Adapted from lord-gnomington/watch.py ``fire_trigger``: the event is fed
-    as the prompt, the agent acts through its Filament MCP tools under an
-    explicit allow-list, and exits. State lives in Filament, not in a
-    long-lived context. --strict-mcp-config keeps the run to *only* the
-    Filament server (none of the host's personal MCP servers).
+    A newline-delimited JSON record per relevant push — the raw event, nothing
+    decided. Your Claude Code session watches this file (Monitor / tail) and
+    chooses whether and how to respond via the Filament MCP tools, keeping its
+    own context across events. We don't spawn anything: the tailer is plumbing,
+    the behaviour is yours.
     """
-    system_prompt = _BASE_SYSTEM_PROMPT
-    if SYSTEM_PROMPT_EXTRA:
-        system_prompt = f"{system_prompt}\n\n{SYSTEM_PROMPT_EXTRA}"
-
-    cmd = [
-        "claude",
-        "-p",
-        build_prompt(summary),
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--mcp-config",
-        MCP_CONFIG,
-        "--strict-mcp-config",
-        "--allowed-tools",
-        ALLOWED_TOOLS,
-        "--append-system-prompt",
-        system_prompt,
-    ]
-    if CLAUDE_MODEL:
-        cmd += ["--model", CLAUDE_MODEL]
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-    except FileNotFoundError:
-        sys.exit("agent_listen: `claude` not on PATH — install the Claude Code CLI")
-    # Stream the woken claude's output through so the operator can watch it work.
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        sys.stdout.write(f"  claude| {line}")
-    proc.wait()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    record = {"received_ms": int(time.time() * 1000), **summary}
+    with open(INBOX, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 # ---------------------------------------------------------------- push handler
@@ -421,7 +350,7 @@ def on_push(data, persistent_id, _obj=None) -> None:
             print(f"agent_listen: pong failed: {e}")
         return
 
-    # (b) Real activity -> a fresh scoped claude -p.
+    # (b) Real activity -> append to the inbox your session tails.
     summary = summarize_message(payload)
     relevant = is_relevant(summary)
     print(
@@ -436,11 +365,11 @@ def on_push(data, persistent_id, _obj=None) -> None:
         return
     _mark_seen(_seen, persistent_id)
     where = summary["room_name"] or summary["room_id"]
-    print(f"agent_listen: wake — {summary['branch_type']} in {where!r}")
+    print(f"agent_listen: inbox <- {summary['branch_type']} in {where!r}")
     try:
-        fire_trigger(summary)
+        append_to_inbox(summary)
     except Exception as e:  # noqa: BLE001 — one bad event must not kill the loop
-        print(f"agent_listen: trigger failed: {e}")
+        print(f"agent_listen: inbox append failed: {e}")
 
 
 # ---------------------------------------------------------------- heartbeat
@@ -538,7 +467,7 @@ async def run() -> None:
     stop = threading.Event()
     threading.Thread(target=_heartbeat_loop, args=(stop,), daemon=True).start()
 
-    print(f"agent_listen: listening — tools={ALLOWED_TOOLS!r}. Ctrl-C to stop.")
+    print(f"agent_listen: listening — inbox={INBOX}. Ctrl-C to stop.")
     await fcm.start()
     try:
         await asyncio.Event().wait()
