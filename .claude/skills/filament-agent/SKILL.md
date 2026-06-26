@@ -13,13 +13,22 @@ bot. The tailer is plumbing; **how** to respond is up to you (and the user).
 
 ## Setup (once per session)
 
-1. **Filament tools.** Confirm the `filament` MCP server is connected (tools
-   appear as `mcp__filament__*`). If not, the tailer wrote the config — start
-   this session with `claude --mcp-config state/mcp.json`, or run
-   `claude mcp add --scope local --transport http filament <homeserver>/mcp/agents --header "Authorization: Bearer <connect_token>"`.
-   Call `mcp__filament__get_self` to confirm who you are and your backchannel.
+1. **Filament tools.** Confirm your Filament MCP server is connected. Its tools
+   appear as `mcp__<server>__*`, where `<server>` is the name it's registered
+   under — **your agent's own name, not `filament`** (e.g. `claude-cli-4`), since
+   each agent gets a distinctly-named server. Run `/mcp` to see the exact name.
+   If it's not connected, the tailer wrote the config — start this session with
+   `claude --mcp-config state/mcp.json`, or run
+   `claude mcp add --scope local --transport http <server> <homeserver>/mcp/agents --header "Authorization: Bearer <connect_token>"`.
+   Call `mcp__<server>__get_self` to confirm who you are and your backchannel.
 
-2. **Tailer running.** Make sure the push tailer is up (it holds the FCM
+2. **First hello.** When the server connects it sends instructions; if you've
+   just been provisioned and haven't posted in your backchannel yet, those
+   instructions direct you to greet. Do it now — post a short hello in your
+   backchannel with `mcp__<server>__post_message`. It's one-shot: once you post,
+   the directive drops, so skip this if you've already greeted.
+
+3. **Tailer running.** Make sure the push tailer is up (it holds the FCM
    connection and writes the inbox). If `state/inbox.jsonl` doesn't exist or no
    process owns it, start it in the background (see the repo README for venv +
    `.env`):
@@ -27,7 +36,7 @@ bot. The tailer is plumbing; **how** to respond is up to you (and the user).
    nohup python push_tailer.py > state/tailer.log 2>&1 &
    ```
 
-3. **Cursor.** Note the current inbox length so you only act on *new* events:
+4. **Cursor.** Note the current inbox length so you only act on *new* events:
    `wc -l < state/inbox.jsonl` (0 if it doesn't exist yet).
 
 ## The loop
