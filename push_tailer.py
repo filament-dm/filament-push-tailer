@@ -578,47 +578,45 @@ def _claim_pid_file() -> None:
     retried — two starters can both remove a stale file, but the retried
     O_EXCL still admits only one."""
     os.makedirs(STATE_DIR, exist_ok=True)
-    unparseable_reads = 0
-    for _ in range(5):
+    # The claim appears atomically COMPLETE or not at all: the PID is written
+    # to a private temp file first, and os.link() publishes it — an atomic
+    # succeed-or-FileExistsError. No observer can ever see a partial claim,
+    # which is what previously forced heuristics for empty files (and their
+    # races). Any unparseable claim file is therefore garbage by construction
+    # and safe to clear immediately.
+    tmp = f"{PID_FILE}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        for _ in range(3):
+            try:
+                os.link(tmp, PID_FILE)
+                return
+            except FileExistsError:
+                pass
+            try:
+                with open(PID_FILE) as f:
+                    pid = int(f.read().strip())
+            except FileNotFoundError:
+                continue  # holder vanished between link-attempt and read
+            except ValueError:
+                pid = None  # can't be a mid-write claimant — garbage
+            if pid is not None and _pid_alive(pid):
+                sys.exit(
+                    f"agent_listen: another tailer (pid {pid}) already owns "
+                    f"this checkout — one per state dir. Stop it or remove "
+                    f"{PID_FILE}."
+                )
+            try:  # stale/garbage claim — clear it; the retried atomic link
+                os.remove(PID_FILE)  # serializes whoever's left
+            except FileNotFoundError:
+                pass
+        sys.exit(f"agent_listen: could not claim {PID_FILE} after retries")
+    finally:
         try:
-            fd = os.open(PID_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            with os.fdopen(fd, "w") as f:
-                f.write(str(os.getpid()))
-            return
-        except FileExistsError:
-            pass
-        try:
-            with open(PID_FILE) as f:
-                pid = int(f.read().strip())
-        except FileNotFoundError:
-            continue  # holder vanished between create-attempt and read — retry
-        except ValueError:
-            # Empty/garbled. Either the winner is between create and write —
-            # gone within one pause — or a starter died mid-claim, leaving a
-            # husk that would otherwise wedge the lock until hand-deleted.
-            # One pause distinguishes them: still unparseable after it means
-            # nobody is finishing that write; clear it and let the retried
-            # exclusive create serialize whoever's left.
-            unparseable_reads += 1
-            if unparseable_reads >= 2:
-                try:
-                    os.remove(PID_FILE)
-                except FileNotFoundError:
-                    pass
-            else:
-                time.sleep(0.2)
-            continue
-        unparseable_reads = 0
-        if _pid_alive(pid):
-            sys.exit(
-                f"agent_listen: another tailer (pid {pid}) already owns this "
-                f"checkout — one per state dir. Stop it or remove {PID_FILE}."
-            )
-        try:  # stale claim — clear it; the retried O_EXCL serializes winners
-            os.remove(PID_FILE)
+            os.remove(tmp)
         except FileNotFoundError:
             pass
-    sys.exit(f"agent_listen: could not claim {PID_FILE} after retries")
 
 
 def main() -> None:
