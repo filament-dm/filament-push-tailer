@@ -578,6 +578,7 @@ def _claim_pid_file() -> None:
     retried — two starters can both remove a stale file, but the retried
     O_EXCL still admits only one."""
     os.makedirs(STATE_DIR, exist_ok=True)
+    unparseable_reads = 0
     for _ in range(5):
         try:
             fd = os.open(PID_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -589,11 +590,25 @@ def _claim_pid_file() -> None:
         try:
             with open(PID_FILE) as f:
                 pid = int(f.read().strip())
-        except (FileNotFoundError, ValueError):
-            # Holder vanished mid-read, or the winner hasn't finished writing
-            # its PID yet — brief pause, then retry the claim.
-            time.sleep(0.2)
+        except FileNotFoundError:
+            continue  # holder vanished between create-attempt and read — retry
+        except ValueError:
+            # Empty/garbled. Either the winner is between create and write —
+            # gone within one pause — or a starter died mid-claim, leaving a
+            # husk that would otherwise wedge the lock until hand-deleted.
+            # One pause distinguishes them: still unparseable after it means
+            # nobody is finishing that write; clear it and let the retried
+            # exclusive create serialize whoever's left.
+            unparseable_reads += 1
+            if unparseable_reads >= 2:
+                try:
+                    os.remove(PID_FILE)
+                except FileNotFoundError:
+                    pass
+            else:
+                time.sleep(0.2)
             continue
+        unparseable_reads = 0
         if _pid_alive(pid):
             sys.exit(
                 f"agent_listen: another tailer (pid {pid}) already owns this "
