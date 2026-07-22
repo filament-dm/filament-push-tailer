@@ -73,6 +73,20 @@ FIREBASE_DEFAULTS = {
 # principal's status dot reflect "this sidecar is actually up".
 HEARTBEAT_SECONDS = 240
 
+# Update check (mirrors hermes-filament-fcm's update_check): compare the local
+# VERSION file against main on GitHub, once shortly after startup and then
+# daily. A newer version is announced as a synthetic INBOX event — the inbox is
+# already the one channel the session watches, so the update notice reaches the
+# principal the same way any message does: the session relays it in Filament.
+# Never load-bearing: any failure is swallowed; the tailer's job is pushes.
+VERSION_FILE = os.path.join(ROOT, "VERSION")
+REMOTE_VERSION_URL = (
+    "https://raw.githubusercontent.com/filament-dm/filament-push-tailer/main/VERSION"
+)
+UPDATE_NOTICE = os.path.join(STATE_DIR, "update_notice.json")
+UPDATE_CHECK_FIRST_S = 60
+UPDATE_CHECK_INTERVAL_S = 86400
+
 
 def env(key: str, default: str | None = None, required: bool = False) -> str:
     val = os.environ.get(key, default)
@@ -384,6 +398,63 @@ def _heartbeat_loop(stop: threading.Event) -> None:
             print(f"agent_listen: heartbeat failed: {e}")
 
 
+# ---------------------------------------------------------------- update check
+
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    try:
+        return tuple(int(p) for p in text.strip().split("."))
+    except ValueError:
+        return None
+
+
+def _check_for_update() -> None:
+    """One comparison of local VERSION vs main; announce a newer one ONCE per
+    version, as an inbox event the session will relay to the principal."""
+    import urllib.request
+
+    with open(VERSION_FILE) as f:
+        local_txt = f.read().strip()
+    with urllib.request.urlopen(REMOTE_VERSION_URL, timeout=15) as r:
+        remote_txt = r.read().decode().strip()
+    local, remote = _parse_version(local_txt), _parse_version(remote_txt)
+    if not local or not remote or remote <= local:
+        return
+    try:
+        with open(UPDATE_NOTICE) as f:
+            if json.load(f).get("announced") == remote_txt:
+                return  # this version was already announced — stay quiet
+    except (FileNotFoundError, ValueError):
+        pass
+    append_to_inbox(
+        {
+            "type": "sidecar_update",
+            "text": (
+                f"Sidecar update available: v{remote_txt} is out, this tailer "
+                f"runs v{local_txt}. Tell your principal (message_principal) "
+                "to update: git pull in the sidecar repo, then restart the "
+                "tailer. Mention it once — don't nag."
+            ),
+            "current_version": local_txt,
+            "latest_version": remote_txt,
+        }
+    )
+    with open(UPDATE_NOTICE, "w") as f:
+        json.dump({"announced": remote_txt, "at_ms": int(time.time() * 1000)}, f)
+    print(f"agent_listen: update available — v{remote_txt} (running v{local_txt})")
+
+
+def _update_check_loop(stop: threading.Event) -> None:
+    if env("FILAMENT_SIDECAR_UPDATE_CHECK", "on").lower() in ("off", "0", "false"):
+        return
+    delay = UPDATE_CHECK_FIRST_S
+    while not stop.wait(delay):
+        delay = UPDATE_CHECK_INTERVAL_S
+        try:
+            _check_for_update()
+        except Exception as e:  # noqa: BLE001 — never load-bearing
+            print(f"agent_listen: update check failed (ignored): {e}")
+
+
 # ---------------------------------------------------------------- FCM register + run
 
 async def _fcm_register():
@@ -466,6 +537,7 @@ async def run() -> None:
 
     stop = threading.Event()
     threading.Thread(target=_heartbeat_loop, args=(stop,), daemon=True).start()
+    threading.Thread(target=_update_check_loop, args=(stop,), daemon=True).start()
 
     print(f"agent_listen: listening — inbox={INBOX}. Ctrl-C to stop.")
     await fcm.start()
