@@ -38,7 +38,9 @@ Config (env, or a .env beside this file; env wins):
 Dependency:  pip install firebase-messaging
 State:  state/fcm-credentials.json (FCM creds), state/seen.json (dedup),
         state/mcp.json (the Filament MCP server config for your session),
-        state/inbox.jsonl (the append-only event feed your session tails).
+        state/inbox.jsonl (the append-only event feed your session tails),
+        state/tailer.pid (this checkout's tailer — one per state dir),
+        state/update_notice.json (which sidecar version was announced).
 """
 
 from __future__ import annotations
@@ -86,6 +88,12 @@ REMOTE_VERSION_URL = (
 UPDATE_NOTICE = os.path.join(STATE_DIR, "update_notice.json")
 UPDATE_CHECK_FIRST_S = 60
 UPDATE_CHECK_INTERVAL_S = 86400
+
+# One tailer per checkout. The PID file is how "is MY tailer running?" is
+# answered — a name match (pgrep -f) sees tailers from other clones/accounts
+# and lets a bootstrap skip starting the one that feeds THIS state dir,
+# leaving the agent silently deaf.
+PID_FILE = os.path.join(STATE_DIR, "tailer.pid")
 
 
 def env(key: str, default: str | None = None, required: bool = False) -> str:
@@ -547,11 +555,45 @@ async def run() -> None:
         stop.set()
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, ValueError):
+        return False
+
+
+def _claim_pid_file() -> None:
+    """Refuse a second tailer on the same checkout (double-appended inboxes),
+    then record ourselves for `is my tailer running?` checks."""
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        if _pid_alive(pid):
+            sys.exit(
+                f"agent_listen: another tailer (pid {pid}) already owns this "
+                f"checkout — one per state dir. Stop it or remove {PID_FILE}."
+            )
+    except (FileNotFoundError, ValueError):
+        pass
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+
 def main() -> None:
+    _claim_pid_file()
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
         print(f"\nagent_listen: stopped ({time.strftime('%H:%M:%S')})")
+    finally:
+        try:  # only our own claim — a newer tailer may have re-claimed
+            with open(PID_FILE) as f:
+                if int(f.read().strip()) == os.getpid():
+                    os.remove(PID_FILE)
+        except (FileNotFoundError, ValueError):
+            pass
 
 
 if __name__ == "__main__":

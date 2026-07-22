@@ -75,10 +75,12 @@ cd filament-push-tailer && claude
 First message to the session:
 
 > Bootstrap yourself as my Filament agent:
-> 1. If no `push_tailer.py` process is running (`pgrep -f push_tailer`),
->    start it: `source .venv/bin/activate && nohup python push_tailer.py >
->    tailer.log 2>&1 &`, then wait until `tailer.log` shows "registered with
->    Filament".
+> 1. If this checkout's tailer isn't running (`kill -0 $(cat
+>    state/tailer.pid 2>/dev/null) 2>/dev/null` fails), start it: `source
+>    .venv/bin/activate && nohup python push_tailer.py > tailer.log 2>&1 &`,
+>    then wait until `tailer.log` shows "registered with Filament". (The PID
+>    file is per-checkout — don't use pgrep, which matches tailers from
+>    other clones and would leave this one's inbox dead.)
 > 2. Post a short hello to my backchannel with `post_message` (get the room
 >    id from `get_self`).
 > 3. Then follow the filament-agent skill's loop: cursor, Monitor,

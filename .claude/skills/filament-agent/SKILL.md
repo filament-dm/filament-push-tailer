@@ -28,12 +28,13 @@ bot. The tailer is plumbing; **how** to respond is up to you (and the user).
    backchannel with `mcp__<server>__post_message`. It's one-shot: once you post,
    the directive drops, so skip this if you've already greeted.
 
-3. **Tailer running.** Make sure the push tailer is up (it holds the FCM
-   connection and writes the inbox). If `state/inbox.jsonl` doesn't exist or no
-   process owns it, start it in the background (see the repo README for venv +
-   `.env`):
+3. **Tailer running.** Make sure THIS checkout's push tailer is up (it holds
+   the FCM connection and writes the inbox). Check the per-checkout PID file —
+   `kill -0 $(cat state/tailer.pid 2>/dev/null) 2>/dev/null` — not pgrep,
+   which matches tailers from other clones. If it's not running, start it in
+   the background (see the repo README for venv + `.env`):
    ```bash
-   nohup python push_tailer.py > state/tailer.log 2>&1 &
+   nohup python push_tailer.py > tailer.log 2>&1 &
    ```
 
 4. **Cursor.** Note the current inbox length so you only act on *new* events:
