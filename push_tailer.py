@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -555,17 +556,40 @@ async def run() -> None:
         stop.set()
 
 
-def _pid_alive(pid: int) -> bool:
+def _proc_started(pid: int) -> str | None:
+    """The process's start time per ps (POSIX `lstart`), or None if it can't
+    be read. Works across users, unlike signalling."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        started = out.stdout.strip()
+        return started or None
+    except Exception:  # noqa: BLE001 — identity check is best-effort
+        return None
+
+
+def _pid_alive(pid: int, claimed_start: str | None = None) -> bool:
+    """Does `pid` exist AND still refer to the claimant?
+
+    Existence alone isn't identity: after an unclean exit the OS can reuse
+    the PID for an unrelated process, which would wedge the claim ("another
+    tailer owns this") until hand-deleted. The claim records the process
+    start time; a live PID whose start time differs is a reused PID, not the
+    tailer. PermissionError = exists under another user (still comparable
+    via ps). Unknown start times fall back to existence — conservative."""
     try:
         os.kill(pid, 0)
-        return True
     except PermissionError:
-        # Signal refused = the process EXISTS, just owned by another user.
-        # On a shared state dir that's a live foreign tailer — treating it as
-        # dead would let a second account steal the claim and double-append.
-        return True
+        pass  # exists, another user's — identity check below still applies
     except (ProcessLookupError, ValueError):
         return False
+    if claimed_start:
+        live_start = _proc_started(pid)
+        if live_start and live_start != claimed_start:
+            return False  # PID reused by a different process
+    return True
 
 
 def _claim_pid_file() -> None:
@@ -584,9 +608,11 @@ def _claim_pid_file() -> None:
     # which is what previously forced heuristics for empty files (and their
     # races). Any unparseable claim file is therefore garbage by construction
     # and safe to clear immediately.
+    # Line 1: PID (shell checks stay `head -1`-simple). Line 2: the process
+    # start time — the identity that survives PID reuse.
     tmp = f"{PID_FILE}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
-        f.write(str(os.getpid()))
+        f.write(f"{os.getpid()}\n{_proc_started(os.getpid()) or ''}\n")
     try:
         for _ in range(3):
             try:
@@ -594,14 +620,17 @@ def _claim_pid_file() -> None:
                 return
             except FileExistsError:
                 pass
+            claimed_start: str | None = None
             try:
                 with open(PID_FILE) as f:
-                    pid = int(f.read().strip())
+                    lines = f.read().splitlines()
+                pid = int(lines[0].strip())
+                claimed_start = (lines[1].strip() or None) if len(lines) > 1 else None
             except FileNotFoundError:
                 continue  # holder vanished between link-attempt and read
-            except ValueError:
+            except (ValueError, IndexError):
                 pid = None  # can't be a mid-write claimant — garbage
-            if pid is not None and _pid_alive(pid):
+            if pid is not None and _pid_alive(pid, claimed_start):
                 sys.exit(
                     f"agent_listen: another tailer (pid {pid}) already owns "
                     f"this checkout — one per state dir. Stop it or remove "
@@ -628,9 +657,10 @@ def main() -> None:
     finally:
         try:  # only our own claim — a newer tailer may have re-claimed
             with open(PID_FILE) as f:
-                if int(f.read().strip()) == os.getpid():
-                    os.remove(PID_FILE)
-        except (FileNotFoundError, ValueError):
+                first = f.read().splitlines()[0].strip()
+            if int(first) == os.getpid():
+                os.remove(PID_FILE)
+        except (FileNotFoundError, ValueError, IndexError):
             pass
 
 

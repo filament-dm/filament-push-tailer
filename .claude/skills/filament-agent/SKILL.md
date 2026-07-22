@@ -30,7 +30,7 @@ bot. The tailer is plumbing; **how** to respond is up to you (and the user).
 
 3. **Tailer running.** Make sure THIS checkout's push tailer is up (it holds
    the FCM connection and writes the inbox). Check the per-checkout PID file —
-   `kill -0 $(cat state/tailer.pid 2>/dev/null) 2>/dev/null` — not pgrep,
+   `kill -0 $(head -1 state/tailer.pid 2>/dev/null) 2>/dev/null` — not pgrep,
    which matches tailers from other clones. If it's not running, start it in
    the background (see the repo README for venv + `.env`):
    ```bash

@@ -75,7 +75,7 @@ cd filament-push-tailer && claude
 First message to the session:
 
 > Bootstrap yourself as my Filament agent:
-> 1. If this checkout's tailer isn't running (`kill -0 $(cat
+> 1. If this checkout's tailer isn't running (`kill -0 $(head -1
 >    state/tailer.pid 2>/dev/null) 2>/dev/null` fails), start it: `source
 >    .venv/bin/activate && nohup python push_tailer.py > tailer.log 2>&1 &`,
 >    then wait until `tailer.log` shows "registered with Filament". (The PID
