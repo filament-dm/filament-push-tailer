@@ -559,26 +559,51 @@ def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError, ValueError):
+    except PermissionError:
+        # Signal refused = the process EXISTS, just owned by another user.
+        # On a shared state dir that's a live foreign tailer — treating it as
+        # dead would let a second account steal the claim and double-append.
+        return True
+    except (ProcessLookupError, ValueError):
         return False
 
 
 def _claim_pid_file() -> None:
     """Refuse a second tailer on the same checkout (double-appended inboxes),
-    then record ourselves for `is my tailer running?` checks."""
-    try:
-        with open(PID_FILE) as f:
-            pid = int(f.read().strip())
+    then record ourselves for `is my tailer running?` checks.
+
+    The claim is an O_CREAT|O_EXCL create, so concurrent starters serialize on
+    the filesystem: exactly one wins the create; losers read the winner's PID
+    and exit. A stale claim (dead PID) is removed and the exclusive create
+    retried — two starters can both remove a stale file, but the retried
+    O_EXCL still admits only one."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    for _ in range(5):
+        try:
+            fd = os.open(PID_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write(str(os.getpid()))
+            return
+        except FileExistsError:
+            pass
+        try:
+            with open(PID_FILE) as f:
+                pid = int(f.read().strip())
+        except (FileNotFoundError, ValueError):
+            # Holder vanished mid-read, or the winner hasn't finished writing
+            # its PID yet — brief pause, then retry the claim.
+            time.sleep(0.2)
+            continue
         if _pid_alive(pid):
             sys.exit(
                 f"agent_listen: another tailer (pid {pid}) already owns this "
                 f"checkout — one per state dir. Stop it or remove {PID_FILE}."
             )
-    except (FileNotFoundError, ValueError):
-        pass
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
+        try:  # stale claim — clear it; the retried O_EXCL serializes winners
+            os.remove(PID_FILE)
+        except FileNotFoundError:
+            pass
+    sys.exit(f"agent_listen: could not claim {PID_FILE} after retries")
 
 
 def main() -> None:
