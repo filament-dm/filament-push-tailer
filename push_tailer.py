@@ -38,7 +38,9 @@ Config (env, or a .env beside this file; env wins):
 Dependency:  pip install firebase-messaging
 State:  state/fcm-credentials.json (FCM creds), state/seen.json (dedup),
         state/mcp.json (the Filament MCP server config for your session),
-        state/inbox.jsonl (the append-only event feed your session tails).
+        state/inbox.jsonl (the append-only event feed your session tails),
+        state/tailer.pid (this checkout's tailer — one per state dir),
+        state/update_notice.json (which sidecar version was announced).
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -72,6 +75,26 @@ FIREBASE_DEFAULTS = {
 # presence online and decays when we stop, so this is what makes the
 # principal's status dot reflect "this sidecar is actually up".
 HEARTBEAT_SECONDS = 240
+
+# Update check (mirrors hermes-filament-fcm's update_check): compare the local
+# VERSION file against main on GitHub, once shortly after startup and then
+# daily. A newer version is announced as a synthetic INBOX event — the inbox is
+# already the one channel the session watches, so the update notice reaches the
+# principal the same way any message does: the session relays it in Filament.
+# Never load-bearing: any failure is swallowed; the tailer's job is pushes.
+VERSION_FILE = os.path.join(ROOT, "VERSION")
+REMOTE_VERSION_URL = (
+    "https://raw.githubusercontent.com/filament-dm/filament-push-tailer/main/VERSION"
+)
+UPDATE_NOTICE = os.path.join(STATE_DIR, "update_notice.json")
+UPDATE_CHECK_FIRST_S = 60
+UPDATE_CHECK_INTERVAL_S = 86400
+
+# One tailer per checkout. The PID file is how "is MY tailer running?" is
+# answered — a name match (pgrep -f) sees tailers from other clones/accounts
+# and lets a bootstrap skip starting the one that feeds THIS state dir,
+# leaving the agent silently deaf.
+PID_FILE = os.path.join(STATE_DIR, "tailer.pid")
 
 
 def env(key: str, default: str | None = None, required: bool = False) -> str:
@@ -384,6 +407,63 @@ def _heartbeat_loop(stop: threading.Event) -> None:
             print(f"agent_listen: heartbeat failed: {e}")
 
 
+# ---------------------------------------------------------------- update check
+
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    try:
+        return tuple(int(p) for p in text.strip().split("."))
+    except ValueError:
+        return None
+
+
+def _check_for_update() -> None:
+    """One comparison of local VERSION vs main; announce a newer one ONCE per
+    version, as an inbox event the session will relay to the principal."""
+    import urllib.request
+
+    with open(VERSION_FILE) as f:
+        local_txt = f.read().strip()
+    with urllib.request.urlopen(REMOTE_VERSION_URL, timeout=15) as r:
+        remote_txt = r.read().decode().strip()
+    local, remote = _parse_version(local_txt), _parse_version(remote_txt)
+    if not local or not remote or remote <= local:
+        return
+    try:
+        with open(UPDATE_NOTICE) as f:
+            if json.load(f).get("announced") == remote_txt:
+                return  # this version was already announced — stay quiet
+    except (FileNotFoundError, ValueError):
+        pass
+    append_to_inbox(
+        {
+            "type": "sidecar_update",
+            "text": (
+                f"Sidecar update available: v{remote_txt} is out, this tailer "
+                f"runs v{local_txt}. Tell your principal (message_principal) "
+                "to update: git pull in the sidecar repo, then restart the "
+                "tailer. Mention it once — don't nag."
+            ),
+            "current_version": local_txt,
+            "latest_version": remote_txt,
+        }
+    )
+    with open(UPDATE_NOTICE, "w") as f:
+        json.dump({"announced": remote_txt, "at_ms": int(time.time() * 1000)}, f)
+    print(f"agent_listen: update available — v{remote_txt} (running v{local_txt})")
+
+
+def _update_check_loop(stop: threading.Event) -> None:
+    if env("FILAMENT_SIDECAR_UPDATE_CHECK", "on").lower() in ("off", "0", "false"):
+        return
+    delay = UPDATE_CHECK_FIRST_S
+    while not stop.wait(delay):
+        delay = UPDATE_CHECK_INTERVAL_S
+        try:
+            _check_for_update()
+        except Exception as e:  # noqa: BLE001 — never load-bearing
+            print(f"agent_listen: update check failed (ignored): {e}")
+
+
 # ---------------------------------------------------------------- FCM register + run
 
 async def _fcm_register():
@@ -466,6 +546,7 @@ async def run() -> None:
 
     stop = threading.Event()
     threading.Thread(target=_heartbeat_loop, args=(stop,), daemon=True).start()
+    threading.Thread(target=_update_check_loop, args=(stop,), daemon=True).start()
 
     print(f"agent_listen: listening — inbox={INBOX}. Ctrl-C to stop.")
     await fcm.start()
@@ -475,11 +556,112 @@ async def run() -> None:
         stop.set()
 
 
+def _proc_started(pid: int) -> str | None:
+    """The process's start time per ps (POSIX `lstart`), or None if it can't
+    be read. Works across users, unlike signalling."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        started = out.stdout.strip()
+        return started or None
+    except Exception:  # noqa: BLE001 — identity check is best-effort
+        return None
+
+
+def _pid_alive(pid: int, claimed_start: str | None = None) -> bool:
+    """Does `pid` exist AND still refer to the claimant?
+
+    Existence alone isn't identity: after an unclean exit the OS can reuse
+    the PID for an unrelated process, which would wedge the claim ("another
+    tailer owns this") until hand-deleted. The claim records the process
+    start time; a live PID whose start time differs is a reused PID, not the
+    tailer. PermissionError = exists under another user (still comparable
+    via ps). Unknown start times fall back to existence — conservative."""
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        pass  # exists, another user's — identity check below still applies
+    except (ProcessLookupError, ValueError):
+        return False
+    if claimed_start:
+        live_start = _proc_started(pid)
+        if live_start and live_start != claimed_start:
+            return False  # PID reused by a different process
+    return True
+
+
+def _claim_pid_file() -> None:
+    """Refuse a second tailer on the same checkout (double-appended inboxes),
+    then record ourselves for `is my tailer running?` checks.
+
+    The claim is an O_CREAT|O_EXCL create, so concurrent starters serialize on
+    the filesystem: exactly one wins the create; losers read the winner's PID
+    and exit. A stale claim (dead PID) is removed and the exclusive create
+    retried — two starters can both remove a stale file, but the retried
+    O_EXCL still admits only one."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    # The claim appears atomically COMPLETE or not at all: the PID is written
+    # to a private temp file first, and os.link() publishes it — an atomic
+    # succeed-or-FileExistsError. No observer can ever see a partial claim,
+    # which is what previously forced heuristics for empty files (and their
+    # races). Any unparseable claim file is therefore garbage by construction
+    # and safe to clear immediately.
+    # Line 1: PID (shell checks stay `head -1`-simple). Line 2: the process
+    # start time — the identity that survives PID reuse.
+    tmp = f"{PID_FILE}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(f"{os.getpid()}\n{_proc_started(os.getpid()) or ''}\n")
+    try:
+        for _ in range(3):
+            try:
+                os.link(tmp, PID_FILE)
+                return
+            except FileExistsError:
+                pass
+            claimed_start: str | None = None
+            try:
+                with open(PID_FILE) as f:
+                    lines = f.read().splitlines()
+                pid = int(lines[0].strip())
+                claimed_start = (lines[1].strip() or None) if len(lines) > 1 else None
+            except FileNotFoundError:
+                continue  # holder vanished between link-attempt and read
+            except (ValueError, IndexError):
+                pid = None  # can't be a mid-write claimant — garbage
+            if pid is not None and _pid_alive(pid, claimed_start):
+                sys.exit(
+                    f"agent_listen: another tailer (pid {pid}) already owns "
+                    f"this checkout — one per state dir. Stop it or remove "
+                    f"{PID_FILE}."
+                )
+            try:  # stale/garbage claim — clear it; the retried atomic link
+                os.remove(PID_FILE)  # serializes whoever's left
+            except FileNotFoundError:
+                pass
+        sys.exit(f"agent_listen: could not claim {PID_FILE} after retries")
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+
+
 def main() -> None:
+    _claim_pid_file()
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
         print(f"\nagent_listen: stopped ({time.strftime('%H:%M:%S')})")
+    finally:
+        try:  # only our own claim — a newer tailer may have re-claimed
+            with open(PID_FILE) as f:
+                first = f.read().splitlines()[0].strip()
+            if int(first) == os.getpid():
+                os.remove(PID_FILE)
+        except (FileNotFoundError, ValueError, IndexError):
+            pass
 
 
 if __name__ == "__main__":

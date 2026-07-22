@@ -3,3 +3,4 @@ state/
 .claude-home/
 __pycache__/
 .venv/
+tailer.log

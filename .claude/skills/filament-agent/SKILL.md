@@ -28,12 +28,13 @@ bot. The tailer is plumbing; **how** to respond is up to you (and the user).
    backchannel with `mcp__<server>__post_message`. It's one-shot: once you post,
    the directive drops, so skip this if you've already greeted.
 
-3. **Tailer running.** Make sure the push tailer is up (it holds the FCM
-   connection and writes the inbox). If `state/inbox.jsonl` doesn't exist or no
-   process owns it, start it in the background (see the repo README for venv +
-   `.env`):
+3. **Tailer running.** Make sure THIS checkout's push tailer is up (it holds
+   the FCM connection and writes the inbox). Check the per-checkout PID file —
+   `kill -0 $(head -1 state/tailer.pid 2>/dev/null) 2>/dev/null` — not pgrep,
+   which matches tailers from other clones. If it's not running, start it in
+   the background (see the repo README for venv + `.env`):
    ```bash
-   nohup python push_tailer.py > state/tailer.log 2>&1 &
+   nohup python push_tailer.py > tailer.log 2>&1 &
    ```
 
 4. **Cursor.** Note the current inbox length so you only act on *new* events:
@@ -51,7 +52,11 @@ Repeat:
    event with `room_id`, `event_id`, `thread_id` (optional), `sender`, `text`,
    `is_direct`, `is_mention`, etc.
 
-3. **Respond, your way.** For each event decide whether and how to act, then use
+3. **Mark it seen.** For a message event, `react` to its `event_id` with "👀"
+   before doing anything else — the same processing marker Hermes agents use,
+   so people see their message was picked up.
+
+4. **Respond, your way.** For each event decide whether and how to act, then use
    the Filament tools:
    - read context first — `get_recent_messages`, `get_thread`, `get_user_profile`;
    - reply where it came from — `reply_in_thread` if there's a `thread_id`, else
@@ -59,7 +64,21 @@ Repeat:
    You have full session memory, so you can carry a conversation, not just
    one-shot replies.
 
-4. **Advance the cursor** to the new inbox length, then loop back to step 1.
+5. **Clear the marker.** Once your reply is posted, `unreact` the "👀" from the
+   event you marked in step 3. If you chose not to reply, still unreact.
+
+6. **Advance the cursor** to the new inbox length, then IMMEDIATELY return to
+   step 1 and start the next Monitor wait. Never end your turn without a
+   Monitor call running — a session that isn't waiting on the inbox isn't the
+   agent, however good its last answer was.
+
+### Special events
+
+- **`"type": "sidecar_update"`** — the tailer noticed a newer sidecar version
+  on GitHub. Relay it to your principal ONCE (`message_principal`, or a short
+  post in the backchannel): say the version and that the fix is `git pull` in
+  the sidecar repo + restarting the tailer. No 👀 needed, don't repeat it, and
+  don't act on the update yourself.
 
 ## Notes
 

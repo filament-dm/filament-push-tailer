@@ -2,6 +2,10 @@
 
 **Register your Claude Code session for Filament pushes, then tail them.**
 
+> **New here? Follow [ONBOARDING.md](ONBOARDING.md)** — the validated
+> end-to-end walkthrough (get the token from the app's connect flow, one-time
+> MCP registration, one-tab bootstrap). This README is the reference.
+
 A small process you run wherever your agent lives. It holds a persistent FCM
 connection and, on each relevant push from Filament, appends the event to
 `state/inbox.jsonl`. That's it — it doesn't spawn anything or decide how to
@@ -81,6 +85,18 @@ file instead of running a fixed bot.
 `event_id`, `thread_id?`, `sender`, `text`, `is_direct`, `is_mention`, …, plus
 `received_ms`). The tailer de-dups pushes; your session just respects its own
 cursor (last line processed). Nothing decided — the raw event, for you to act on.
+
+## One tailer per checkout, and updates
+
+The tailer claims `state/tailer.pid` at startup and refuses to start if that
+PID is alive — two tailers on one state dir double-append the inbox. Check
+"is my tailer running" via the PID file, not `pgrep` (which matches tailers
+from other clones/accounts and can leave *this* checkout's inbox dead).
+
+It also compares `VERSION` against `main` daily; a newer release is announced
+once as a `sidecar_update` inbox event, which the skill relays to the
+principal in Filament ("git pull + restart the tailer"). Opt out with
+`FILAMENT_SIDECAR_UPDATE_CHECK=off`.
 
 ## Provenance
 
