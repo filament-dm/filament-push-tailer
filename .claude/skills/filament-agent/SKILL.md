@@ -19,7 +19,7 @@ bot. The tailer is plumbing; **how** to respond is up to you (and the user).
    each agent gets a distinctly-named server. Run `/mcp` to see the exact name.
    If it's not connected, the tailer wrote the config — start this session with
    `claude --mcp-config state/mcp.json`, or run
-   `claude mcp add --scope local --transport http <server> <homeserver>/mcp/agents --header "Authorization: Bearer <connect_token>"`.
+   `claude mcp add --scope local --transport http <server> https://api.filament.dm/mcp/agents --header "Authorization: Bearer <api_key>"`.
    Call `mcp__<server>__get_self` to confirm who you are and your backchannel.
 
 2. **First hello.** When the server connects it sends instructions; if you've
