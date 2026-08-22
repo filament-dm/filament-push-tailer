@@ -1,2 +1,9 @@
 # filament agent listen — runtime deps
-firebase-messaging>=0.4
+#
+# firebase-messaging comes from the filament-dm fork, not PyPI. Upstream slices the
+# Crypto-Key and Encryption push headers instead of parsing them, so extra header
+# parameters reach the base64 decoder along with the key ("Incorrect padding"), and it
+# tears down the whole FcmPushClient on one bad push — the process lingers alive while
+# pushes silently stop. The fork parses the headers, restores base64 padding, and skips
+# an undecryptable message instead of shutting down.
+firebase-messaging @ git+https://github.com/filament-dm/firebase-messaging.git@81a7249a9510569e74f9e210a8b7d4873485cfac
