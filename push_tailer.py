@@ -34,6 +34,7 @@ Config (env, or a .env beside this file; env wins):
 
 Dependency:  pip install firebase-messaging
 State:  state/fcm-credentials.json (FCM creds), state/seen.json (dedup),
+        state/wake_policy.json (which emoji reactions wake the agent),
         state/mcp.json (the Filament MCP server config for your session),
         state/inbox.jsonl (the append-only event feed your session tails),
         state/tailer.pid (this checkout's tailer — one per state dir),
@@ -58,6 +59,7 @@ CREDS = os.path.join(STATE_DIR, "fcm-credentials.json")
 SEEN = os.path.join(STATE_DIR, "seen.json")
 MCP_CONFIG = os.path.join(STATE_DIR, "mcp.json")
 INBOX = os.path.join(STATE_DIR, "inbox.jsonl")
+WAKE_POLICY = os.path.join(STATE_DIR, "wake_policy.json")
 
 # Filament's Firebase project — public config (same values the Electron /
 # mobile clients and the hermes-filament-fcm adapter use). Override via env.
@@ -86,6 +88,16 @@ REMOTE_VERSION_URL = (
 UPDATE_NOTICE = os.path.join(STATE_DIR, "update_notice.json")
 UPDATE_CHECK_FIRST_S = 60
 UPDATE_CHECK_INTERVAL_S = 86400
+
+# Eyeballs ack. The agent session keeps SESSION_ALIVE freshly touched while it
+# is watching the inbox; while that file is fresh, the tailer posts the 👀
+# processing marker the moment a relevant message lands, instead of waiting for
+# the session to wake (several seconds of model latency). The session still
+# replies and clears the marker. Without a live session the tailer stays
+# silent, so 👀 keeps meaning "an agent is actually looking", not merely "the
+# push reached this machine".
+SESSION_ALIVE = os.path.join(STATE_DIR, "session-alive")
+SESSION_ALIVE_MAX_AGE_S = 20
 
 # One tailer per checkout. The PID file is how "is MY tailer running?" is
 # answered — a name match (pgrep -f) sees tailers from other clones/accounts
@@ -304,6 +316,81 @@ def is_relevant(summary: dict) -> bool:
     )
 
 
+# ---------------------------------------------------------------- reaction wake
+
+# The marker the tailer adds to a message it is handing to the session. Never
+# a wake trigger: a policy listing it would make the agent re-wake itself on
+# its own ack, without end.
+PROCESSING_REACTIONS = ("👀",)
+
+
+def read_wake_policy() -> dict:
+    """Which emoji reactions wake the agent, read fresh per push so an edit
+    takes effect without a restart.
+
+        {"trigger_emojis": ["🐞", "🐛"],
+         "per_channel": {"<room_id>": {"trigger_emojis": ["🔥"]}}}
+
+    Absent or unreadable means no triggers at all, which is what a tailer
+    without a policy does: reactions wake nothing.
+    """
+    try:
+        with open(WAKE_POLICY) as f:
+            loaded = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def trigger_emojis(policy: dict, room_id: str) -> list:
+    """The triggers for one room. A channel's own list REPLACES the global
+    one rather than adding to it, so a channel can narrow as well as widen -
+    the same resolution the Hermes plugin's wake policy uses."""
+    per_channel = policy.get("per_channel")
+    channel = per_channel.get(room_id) if isinstance(per_channel, dict) else None
+    scope = channel if isinstance(channel, dict) and "trigger_emojis" in channel else policy
+    emojis = scope.get("trigger_emojis")
+    return emojis if isinstance(emojis, list) else []
+
+
+def summarize_reaction(payload: dict) -> dict:
+    """Flatten a reaction PushPayload, the way summarize_message does for a
+    message. ``event_id`` is the reaction itself; ``target_event_id`` is the
+    message it sits on, which is the one the session acts on."""
+    branch = payload.get("branch") or {}
+    return {
+        "branch_type": branch.get("type", ""),
+        "room_id": payload.get("room_id", ""),
+        "room_name": branch.get("channel", branch.get("sender", "")),
+        "sender": branch.get("sender", ""),
+        "sender_id": branch.get("sender_id", ""),
+        "is_direct": payload.get("is_direct", False),
+        "is_from_self": branch.get("is_from_self", False),
+        "thread_id": branch.get("thread_id"),
+        "event_id": payload.get("event_id", ""),
+        "key": branch.get("key", ""),
+        "target_event_id": branch.get("target_event_id", ""),
+        "removed": bool(branch.get("removed", False)),
+    }
+
+
+def reaction_wakes(summary: dict, policy: dict) -> bool:
+    """Should this reaction wake the agent?
+
+    Only an emoji the policy lists as a trigger for that room, and never the
+    agent's own reaction, an un-react, or the processing marker. Never in the
+    backchannel either: a reaction there is the principal annotating a
+    message, not asking for a turn.
+    """
+    if summary.get("is_from_self") or summary.get("removed"):
+        return False
+    if summary.get("key") in PROCESSING_REACTIONS:
+        return False
+    if BACKCHANNEL_ROOM_ID and summary.get("room_id") == BACKCHANNEL_ROOM_ID:
+        return False
+    return summary.get("key") in trigger_emojis(policy, summary.get("room_id", ""))
+
+
 # ---------------------------------------------------------------- inbox + MCP config
 
 def write_mcp_config() -> None:
@@ -328,6 +415,31 @@ def write_mcp_config() -> None:
         json.dump(config, f, indent=2)
 
 
+def _session_is_live() -> bool:
+    try:
+        return (time.time() - os.path.getmtime(SESSION_ALIVE)) < SESSION_ALIVE_MAX_AGE_S
+    except OSError:
+        return False
+
+
+def _ack_eyes(event_id: str) -> bool:
+    """Post the 👀 marker for a message the session is about to handle.
+
+    Only when a live session is attached (see SESSION_ALIVE). Returns whether
+    the reaction was posted, so the inbox record can carry ``acked`` and the
+    session knows to skip its own react (it still unreacts after replying).
+    """
+    if not _session_is_live():
+        return False
+    try:
+        client.call_tool("react", {"message_id": event_id, "key": "👀"})
+        print(f"agent_listen: eyes ack on {event_id}")
+        return True
+    except Exception as e:  # noqa: BLE001 — the ack is best-effort
+        print(f"agent_listen: eyes ack failed: {e}")
+        return False
+
+
 def append_to_inbox(summary: dict) -> None:
     """Append one event to the inbox feed your session tails.
 
@@ -346,6 +458,32 @@ def append_to_inbox(summary: dict) -> None:
 # ---------------------------------------------------------------- push handler
 
 _seen: set[str] = set()
+
+
+def _handle_reaction(payload: dict, persistent_id) -> None:
+    """A reaction push: wake the session only if the policy says this emoji
+    is a trigger here."""
+    summary = summarize_reaction(payload)
+    wakes = reaction_wakes(summary, read_wake_policy())
+    where = summary["room_name"] or summary["room_id"]
+    print(
+        f"agent_listen: reaction push - key={summary.get('key')!r} in {where!r} "
+        f"from_self={summary.get('is_from_self')} removed={summary.get('removed')} "
+        f"wakes={wakes}"
+    )
+    if not wakes or persistent_id in _seen:
+        return
+    _mark_seen(_seen, persistent_id)
+    print(f"agent_listen: inbox <- reaction {summary['key']} in {where!r}")
+    # The marker goes on the message that was reacted to, not on the reaction:
+    # that message is what the session reads and answers, and what the person
+    # who reacted is watching.
+    if summary.get("target_event_id"):
+        summary["acked"] = _ack_eyes(summary["target_event_id"])
+    try:
+        append_to_inbox(summary)
+    except Exception as e:  # noqa: BLE001 - one bad event must not kill the loop
+        print(f"agent_listen: inbox append failed: {e}")
 
 
 def on_push(data, persistent_id, _obj=None) -> None:
@@ -369,7 +507,15 @@ def on_push(data, persistent_id, _obj=None) -> None:
             print(f"agent_listen: pong failed: {e}")
         return
 
-    # (b) Real activity -> append to the inbox your session tails.
+    # (b) A reaction -> its own gate. Reactions carry no text, so the message
+    # path below would either drop them or file empty events; whether one is
+    # worth a turn is a question about the emoji, not about addressing.
+    branch = payload.get("branch")
+    if isinstance(branch, dict) and branch.get("type") == "reaction":
+        _handle_reaction(payload, persistent_id)
+        return
+
+    # (c) Real activity -> append to the inbox your session tails.
     summary = summarize_message(payload)
     relevant = is_relevant(summary)
     print(
@@ -385,6 +531,8 @@ def on_push(data, persistent_id, _obj=None) -> None:
     _mark_seen(_seen, persistent_id)
     where = summary["room_name"] or summary["room_id"]
     print(f"agent_listen: inbox <- {summary['branch_type']} in {where!r}")
+    if summary.get("event_id"):
+        summary["acked"] = _ack_eyes(summary["event_id"])
     try:
         append_to_inbox(summary)
     except Exception as e:  # noqa: BLE001 — one bad event must not kill the loop

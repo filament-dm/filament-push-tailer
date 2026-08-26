@@ -44,17 +44,29 @@ bot. The tailer is plumbing; **how** to respond is up to you (and the user).
 
 Repeat:
 
-1. **Wait for a new event** with the Monitor tool — block until the inbox grows
-   past your cursor, e.g. monitor the condition
-   `[ "$(wc -l < state/inbox.jsonl 2>/dev/null || echo 0)" -gt <cursor> ]`.
+1. **Wait for a new event** with a persistent Monitor that (a) streams each new
+   inbox line as the notification itself, so the event JSON reaches you without
+   an extra read step, and (b) keeps `state/session-alive` freshly touched, so
+   the tailer knows a session is attached and posts the 👀 marker instantly on
+   your behalf:
+   ```bash
+   ( while true; do touch state/session-alive; sleep 5; done ) & TOUCH=$!
+   trap 'kill $TOUCH 2>/dev/null' EXIT TERM INT
+   tail -n +<cursor+1> -F state/inbox.jsonl
+   ```
 
-2. **Read the new lines** (everything after your cursor). Each line is one JSON
-   event with `room_id`, `event_id`, `thread_id` (optional), `sender`, `text`,
-   `is_direct`, `is_mention`, etc.
+2. **Read the event.** Each line is one JSON event with `room_id`, `event_id`,
+   `thread_id` (optional), `sender`, `text`, `is_direct`, `is_mention`, etc.
 
-3. **Mark it seen.** For a message event, `react` to its `event_id` with "👀"
-   before doing anything else — the same processing marker Hermes agents use,
-   so people see their message was picked up.
+   A `"branch_type": "reaction"` event has no `text`. Someone reacted with an
+   emoji the wake policy lists, and the message they reacted to is
+   `target_event_id` - read and answer THAT, not `event_id`, which is the
+   reaction. The 👀 marker goes on `target_event_id` too, so unreact it there.
+
+3. **Mark it seen.** If the event has `"acked": true` the tailer already posted
+   the 👀 processing marker for you — skip this step. Otherwise `react` to its
+   `event_id` with "👀" before doing anything else — the same marker Hermes
+   agents use, so people see their message was picked up.
 
 4. **Respond, your way.** For each event decide whether and how to act, then use
    the Filament tools:
@@ -65,12 +77,14 @@ Repeat:
    one-shot replies.
 
 5. **Clear the marker.** Once your reply is posted, `unreact` the "👀" from the
-   event you marked in step 3. If you chose not to reply, still unreact.
+   event — whether you posted it or the tailer did (`acked: true`; same agent
+   identity, so unreact works either way). If you chose not to reply, still
+   unreact.
 
-6. **Advance the cursor** to the new inbox length, then IMMEDIATELY return to
-   step 1 and start the next Monitor wait. Never end your turn without a
-   Monitor call running — a session that isn't waiting on the inbox isn't the
-   agent, however good its last answer was.
+6. **Keep the watch alive.** The persistent `tail -F` Monitor from step 1 keeps
+   running — no re-arm needed. Never end your turn without it running (restart
+   it if it died) — a session that isn't waiting on the inbox isn't the agent,
+   however good its last answer was.
 
 ### Special events
 

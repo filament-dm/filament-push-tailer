@@ -61,9 +61,39 @@ MCP tools.
 
 `state/inbox.jsonl` is append-only, one JSON event per line (`room_id`,
 `event_id`, `thread_id?`, `sender`, `text`, `is_direct`, `is_mention`, …, plus
-`received_ms`). The tailer de-dups pushes; your session just respects its own
+`received_ms`; a reaction event carries `key` and `target_event_id` instead of
+`text`). The tailer de-dups pushes; your session just respects its own
 cursor (last line processed). Nothing decided — the raw event, for you to act
 on.
+
+## Emoji wakes
+
+A message reaches the inbox when it addresses the agent - a DM, a mention, a
+reply, or anything in the backchannel. A reaction carries no text, so nothing
+about addressing can decide it; the emoji is the whole signal. Write
+`state/wake_policy.json` to say which ones count:
+
+```json
+{
+  "trigger_emojis": ["🐞", "🐛"],
+  "per_channel": { "!bugs:server": { "trigger_emojis": ["🔥"] } }
+}
+```
+
+A channel's list replaces the global one rather than adding to it, so a
+channel can narrow as well as widen. The file is read on every push, so an
+edit takes effect without restarting the tailer, and no file at all means no
+reaction ever wakes the agent.
+
+Four reactions never wake it, whatever the policy says: the agent's own, an
+un-react, the 👀 processing marker (which the tailer adds to every
+message it hands over - honouring it would be an endless loop), and anything
+in the backchannel, where a reaction is the principal annotating rather than
+asking.
+
+A reaction event in the inbox carries `key` and `target_event_id`. The
+message the session reads and answers is `target_event_id` - `event_id` is
+the reaction itself.
 
 ## One tailer per checkout, and updates
 
