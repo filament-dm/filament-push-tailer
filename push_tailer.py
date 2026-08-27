@@ -382,10 +382,14 @@ def skip_reason(summary: dict, policy: dict) -> str | None:
     processing marker, and the backchannel, where a reaction is the principal
     annotating a message rather than asking for a turn.
 
-    The reason is what gets logged. "Did not wake" on its own is unreadable -
-    a trigger emoji suppressed by the room and an emoji nobody configured
-    look identical from the outside.
+    The reason is what gets logged, so the configuration is checked FIRST:
+    an emoji nobody listed did not wake for that reason, in any room. The
+    four overrides are reported only when they suppressed an emoji that was
+    a trigger - which makes each of them mean "your trigger was blocked
+    because X", the one case where naming the override tells you something.
     """
+    if summary.get("key") not in trigger_emojis(policy, summary.get("room_id", "")):
+        return "not_a_trigger"
     if summary.get("is_from_self"):
         return "own_reaction"
     if summary.get("removed"):
@@ -394,8 +398,6 @@ def skip_reason(summary: dict, policy: dict) -> str | None:
         return "processing_marker"
     if BACKCHANNEL_ROOM_ID and summary.get("room_id") == BACKCHANNEL_ROOM_ID:
         return "backchannel"
-    if summary.get("key") not in trigger_emojis(policy, summary.get("room_id", "")):
-        return "not_a_trigger"
     return None
 
 

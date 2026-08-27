@@ -187,3 +187,26 @@ class TestDispatch:
 
     def test_an_unlisted_reaction_files_nothing(self, tmp_path, monkeypatch):
         assert self._run(tmp_path, monkeypatch, "\N{PARTY POPPER}") == []
+
+
+class TestReasonOrdering:
+    """An override is only worth naming when it blocked something that would
+    otherwise have woken the agent. An emoji nobody configured did not wake
+    for that reason, wherever it arrived - saying "backchannel" there implies
+    it would have worked in another channel, which is false."""
+
+    POLICY = {"trigger_emojis": ["\N{LADY BEETLE}"]}
+
+    def test_unconfigured_emoji_in_the_backchannel_is_not_a_trigger(self, monkeypatch):
+        monkeypatch.setattr(push_tailer, "BACKCHANNEL_ROOM_ID", BACKCHANNEL)
+        summary = _reaction("\N{HEAVY BLACK HEART}", room_id=BACKCHANNEL)
+        assert push_tailer.skip_reason(summary, self.POLICY) == "not_a_trigger"
+
+    def test_configured_emoji_in_the_backchannel_names_the_room(self, monkeypatch):
+        monkeypatch.setattr(push_tailer, "BACKCHANNEL_ROOM_ID", BACKCHANNEL)
+        summary = _reaction("\N{LADY BEETLE}", room_id=BACKCHANNEL)
+        assert push_tailer.skip_reason(summary, self.POLICY) == "backchannel"
+
+    def test_unconfigured_emoji_from_self_is_not_a_trigger(self):
+        summary = _reaction("\N{HEAVY BLACK HEART}", is_from_self=True)
+        assert push_tailer.skip_reason(summary, self.POLICY) == "not_a_trigger"
