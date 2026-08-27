@@ -374,21 +374,34 @@ def summarize_reaction(payload: dict) -> dict:
     }
 
 
-def reaction_wakes(summary: dict, policy: dict) -> bool:
-    """Should this reaction wake the agent?
+def skip_reason(summary: dict, policy: dict) -> str | None:
+    """Why this reaction does NOT wake the agent, or None if it does.
 
-    Only an emoji the policy lists as a trigger for that room, and never the
-    agent's own reaction, an un-react, or the processing marker. Never in the
-    backchannel either: a reaction there is the principal annotating a
-    message, not asking for a turn.
+    A wake needs an emoji the policy lists as a trigger for that room. Four
+    things override the list: the agent's own reaction, an un-react, the
+    processing marker, and the backchannel, where a reaction is the principal
+    annotating a message rather than asking for a turn.
+
+    The reason is what gets logged. "Did not wake" on its own is unreadable -
+    a trigger emoji suppressed by the room and an emoji nobody configured
+    look identical from the outside.
     """
-    if summary.get("is_from_self") or summary.get("removed"):
-        return False
+    if summary.get("is_from_self"):
+        return "own_reaction"
+    if summary.get("removed"):
+        return "unreact"
     if summary.get("key") in PROCESSING_REACTIONS:
-        return False
+        return "processing_marker"
     if BACKCHANNEL_ROOM_ID and summary.get("room_id") == BACKCHANNEL_ROOM_ID:
-        return False
-    return summary.get("key") in trigger_emojis(policy, summary.get("room_id", ""))
+        return "backchannel"
+    if summary.get("key") not in trigger_emojis(policy, summary.get("room_id", "")):
+        return "not_a_trigger"
+    return None
+
+
+def reaction_wakes(summary: dict, policy: dict) -> bool:
+    """Whether this reaction wakes the agent."""
+    return skip_reason(summary, policy) is None
 
 
 # ---------------------------------------------------------------- inbox + MCP config
@@ -464,14 +477,13 @@ def _handle_reaction(payload: dict, persistent_id) -> None:
     """A reaction push: wake the session only if the policy says this emoji
     is a trigger here."""
     summary = summarize_reaction(payload)
-    wakes = reaction_wakes(summary, read_wake_policy())
+    reason = skip_reason(summary, read_wake_policy())
     where = summary["room_name"] or summary["room_id"]
     print(
         f"agent_listen: reaction push - key={summary.get('key')!r} in {where!r} "
-        f"from_self={summary.get('is_from_self')} removed={summary.get('removed')} "
-        f"wakes={wakes}"
+        + ("wakes=True" if reason is None else f"wakes=False ({reason})")
     )
-    if not wakes or persistent_id in _seen:
+    if reason is not None or persistent_id in _seen:
         return
     _mark_seen(_seen, persistent_id)
     print(f"agent_listen: inbox <- reaction {summary['key']} in {where!r}")

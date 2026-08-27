@@ -74,31 +74,42 @@ class TestTriggerResolution:
 
 
 class TestReactionWakes:
+    """Every skip carries the reason it was skipped: a configured trigger
+    suppressed by the room and an emoji nobody configured are the same
+    "did not wake" from the outside, and telling them apart is the whole
+    of debugging a quiet agent."""
+
     POLICY = {"trigger_emojis": ["\N{LADY BEETLE}", "\N{EYES}"]}
 
     def test_a_listed_emoji_wakes(self):
+        assert push_tailer.skip_reason(_reaction(), self.POLICY) is None
         assert push_tailer.reaction_wakes(_reaction(), self.POLICY) is True
 
     def test_an_unlisted_emoji_does_not(self):
-        assert push_tailer.reaction_wakes(_reaction("\N{PARTY POPPER}"), self.POLICY) is False
+        summary = _reaction("\N{PARTY POPPER}")
+        assert push_tailer.skip_reason(summary, self.POLICY) == "not_a_trigger"
 
     def test_our_own_reaction_never_wakes(self):
         summary = _reaction(is_from_self=True)
-        assert push_tailer.reaction_wakes(summary, self.POLICY) is False
+        assert push_tailer.skip_reason(summary, self.POLICY) == "own_reaction"
 
     def test_an_unreact_never_wakes(self):
-        assert push_tailer.reaction_wakes(_reaction(removed=True), self.POLICY) is False
+        summary = _reaction(removed=True)
+        assert push_tailer.skip_reason(summary, self.POLICY) == "unreact"
 
     def test_the_processing_marker_never_wakes(self):
         # POLICY lists it on purpose: the tailer adds this marker to every
         # message it hands over, so honouring it would be an endless loop.
-        assert push_tailer.reaction_wakes(_reaction("\N{EYES}"), self.POLICY) is False
+        summary = _reaction("\N{EYES}")
+        assert push_tailer.skip_reason(summary, self.POLICY) == "processing_marker"
 
     def test_the_backchannel_never_wakes(self, monkeypatch):
-        # A reaction there is the principal annotating, not asking.
+        # A reaction there is the principal annotating, not asking - and a
+        # listed trigger is exactly the case that reads as broken without
+        # the reason, since the policy plainly names the emoji.
         monkeypatch.setattr(push_tailer, "BACKCHANNEL_ROOM_ID", BACKCHANNEL)
         summary = _reaction(room_id=BACKCHANNEL)
-        assert push_tailer.reaction_wakes(summary, self.POLICY) is False
+        assert push_tailer.skip_reason(summary, self.POLICY) == "backchannel"
 
 
 class TestSummary:
