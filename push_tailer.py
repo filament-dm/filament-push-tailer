@@ -213,6 +213,16 @@ class FilamentClient:
     def register_push_token(self, token: str) -> dict:
         return self.call_tool("register_push_token", {"token": token})
 
+    def push_tokens(self) -> set[str]:
+        """Pushkeys registered for this agent; empty if they can't be read,
+        which falls back to registering."""
+        try:
+            tokens = self.call_tool("list_push_tokens", {}).get("tokens") or []
+        except FilamentError as e:
+            print(f"agent_listen: list_push_tokens failed ({e}); registering anyway")
+            return set()
+        return {t.get("pushkey") for t in tokens}
+
     def get_self(self) -> dict:
         return self.call_tool("get_self", {})
 
@@ -696,11 +706,16 @@ async def run() -> None:
     fcm, fcm_token = await _fcm_register()
     print(f"agent_listen: FCM token = {fcm_token[:24]}…")
 
-    # Register the token with Filament so DirectPusher routes pushes here.
-    result = client.register_push_token(fcm_token)
-    if not result.get("success"):
-        sys.exit(f"agent_listen: register_push_token failed — {result}")
-    print("agent_listen: registered with Filament")
+    # Register the token with Filament so DirectPusher routes pushes here —
+    # once. The cached creds keep the same token across restarts, and the
+    # server holds one active token per agent, so re-registering is never needed.
+    if fcm_token in client.push_tokens():
+        print("agent_listen: token already registered with Filament")
+    else:
+        result = client.register_push_token(fcm_token)
+        if not result.get("success"):
+            sys.exit(f"agent_listen: register_push_token failed — {result}")
+        print("agent_listen: registered with Filament")
 
     stop = threading.Event()
     threading.Thread(target=_heartbeat_loop, args=(stop,), daemon=True).start()

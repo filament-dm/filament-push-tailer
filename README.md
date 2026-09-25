@@ -24,9 +24,11 @@ python push_tailer.py
 The agent API base URL defaults to `https://api.filament.dm/mcp/agents`; set
 `FILAMENT_AGENT_API_BASE_URL` in `.env` to override it.
 
-On start it identifies itself (`get_self`), registers for pushes
-(`register_push_token`), writes `state/mcp.json` (a ready-made Filament MCP
-server config for your agent), starts a presence heartbeat, then listens —
+On start it identifies itself (`get_self`), registers for pushes once
+(`register_push_token`, skipped when `list_push_tokens` already has the token
+— restarts reuse the cached one), writes `state/mcp.json` (a ready-made
+Filament MCP server config for your agent), starts a presence heartbeat, then
+listens —
 liveness pings are answered automatically, and each relevant message becomes
 a line appended to `state/inbox.jsonl`.
 
