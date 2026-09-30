@@ -104,6 +104,11 @@ PID is alive — two tailers on one state dir double-append the inbox. Check
 "is my tailer running" via the PID file, not `pgrep` (which matches tailers
 from other clones/accounts and can leave *this* checkout's inbox dead).
 
+The tailer exits if its FCM connection is gone for good (the library gives up
+after repeated failures, and a process that kept running would look online
+while no push could reach it). Run it under something that restarts it on
+exit - a supervisor, launchd, or a shell loop.
+
 It also compares `VERSION` against `main` daily; a newer release is announced
 once as a `sidecar_update` inbox event, for your agent to relay to you
 ("git pull + restart the tailer"). Opt out with
