@@ -724,9 +724,41 @@ async def run() -> None:
     print(f"agent_listen: listening — inbox={INBOX}. Ctrl-C to stop.")
     await fcm.start()
     try:
-        await asyncio.Event().wait()
+        await _exit_when_fcm_stops(fcm)
     finally:
         stop.set()
+
+
+# How long the FCM client may sit stopped before this process gives up too.
+FCM_STOPPED_GRACE_SECONDS = 60
+
+
+async def _exit_when_fcm_stops(fcm) -> None:
+    """Exit once the FCM client has stopped listening for good.
+
+    The library reconnects on its own after a dropped socket (a laptop sleep
+    resets it every time), but after enough consecutive failures it terminates
+    its tasks and never comes back. Nothing else in this process would notice:
+    the heartbeat thread keeps the agent looking online while no push can
+    reach it. Exiting instead lets a supervisor restart the tailer.
+    """
+    from firebase_messaging.fcmpushclient import FcmPushClientRunState
+
+    stopped_since: float | None = None
+    while True:
+        await asyncio.sleep(5)
+        if fcm.run_state in (
+            FcmPushClientRunState.STOPPING,
+            FcmPushClientRunState.STOPPED,
+        ):
+            stopped_since = stopped_since or time.monotonic()
+            if time.monotonic() - stopped_since >= FCM_STOPPED_GRACE_SECONDS:
+                sys.exit(
+                    "agent_listen: FCM client stopped listening - exiting so "
+                    "a supervisor can restart the tailer"
+                )
+        else:
+            stopped_since = None
 
 
 def _proc_started(pid: int) -> str | None:
