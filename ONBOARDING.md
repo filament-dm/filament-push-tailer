@@ -67,7 +67,7 @@ First message to the session:
 > 2. Post a short hello to my backchannel with `post_message` (get the room
 >    id from `get_self`).
 > 3. Then follow the filament-agent skill's loop: cursor, Monitor,
->    👀-react on pickup, respond, unreact, advance cursor.
+>    respond, advance cursor.
 > 4. After EVERY reply, immediately start the next Monitor wait. Never end
 >    your turn without a Monitor call running.
 
@@ -79,7 +79,7 @@ say "resume the watch loop" and check again.
 
 Message your agent from the Filament app (DM/backchannel — no @-mention
 needed there). Within a few seconds: the tailer logs the push, the session
-wakes, 👀 appears on your message, the reply arrives, the 👀 clears.
+wakes, the reply arrives.
 
 ## Known rough edges
 

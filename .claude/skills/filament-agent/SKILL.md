@@ -44,14 +44,10 @@ bot. The tailer is plumbing; **how** to respond is up to you (and the user).
 
 Repeat:
 
-1. **Wait for a new event** with a persistent Monitor that (a) streams each new
+1. **Wait for a new event** with a persistent Monitor that streams each new
    inbox line as the notification itself, so the event JSON reaches you without
-   an extra read step, and (b) keeps `state/session-alive` freshly touched, so
-   the tailer knows a session is attached and posts the 👀 marker instantly on
-   your behalf:
+   an extra read step:
    ```bash
-   ( while true; do touch state/session-alive; sleep 5; done ) & TOUCH=$!
-   trap 'kill $TOUCH 2>/dev/null' EXIT TERM INT
    tail -n +<cursor+1> -F state/inbox.jsonl
    ```
 
@@ -61,14 +57,9 @@ Repeat:
    A `"branch_type": "reaction"` event has no `text`. Someone reacted with an
    emoji the wake policy lists, and the message they reacted to is
    `target_event_id` - read and answer THAT, not `event_id`, which is the
-   reaction. The 👀 marker goes on `target_event_id` too, so unreact it there.
+   reaction.
 
-3. **Mark it seen.** If the event has `"acked": true` the tailer already posted
-   the 👀 processing marker for you — skip this step. Otherwise `react` to its
-   `event_id` with "👀" before doing anything else — the same marker Hermes
-   agents use, so people see their message was picked up.
-
-4. **Respond, your way.** For each event decide whether and how to act, then use
+3. **Respond, your way.** For each event decide whether and how to act, then use
    the Filament tools:
    - read context first — `get_recent_messages`, `get_thread`, `get_user_profile`;
    - reply where it came from — `reply_in_thread` if there's a `thread_id`, else
@@ -76,12 +67,7 @@ Repeat:
    You have full session memory, so you can carry a conversation, not just
    one-shot replies.
 
-5. **Clear the marker.** Once your reply is posted, `unreact` the "👀" from the
-   event — whether you posted it or the tailer did (`acked: true`; same agent
-   identity, so unreact works either way). If you chose not to reply, still
-   unreact.
-
-6. **Keep the watch alive.** The persistent `tail -F` Monitor from step 1 keeps
+4. **Keep the watch alive.** The persistent `tail -F` Monitor from step 1 keeps
    running — no re-arm needed. Never end your turn without it running (restart
    it if it died) — a session that isn't waiting on the inbox isn't the agent,
    however good its last answer was.
@@ -91,7 +77,7 @@ Repeat:
 - **`"type": "sidecar_update"`** — the tailer noticed a newer sidecar version
   on GitHub. Relay it to your principal ONCE (`message_principal`, or a short
   post in the backchannel): say the version and that the fix is `git pull` in
-  the sidecar repo + restarting the tailer. No 👀 needed, don't repeat it, and
+  the sidecar repo + restarting the tailer. Don't repeat it, and
   don't act on the update yourself.
 
 ## Notes

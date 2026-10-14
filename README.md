@@ -87,11 +87,9 @@ channel can narrow as well as widen. The file is read on every push, so an
 edit takes effect without restarting the tailer, and no file at all means no
 reaction ever wakes the agent.
 
-Four reactions never wake it, whatever the policy says: the agent's own, an
-un-react, the 👀 processing marker (which the tailer adds to every
-message it hands over - honouring it would be an endless loop), and anything
-in the backchannel, where a reaction is the principal annotating rather than
-asking.
+Three reactions never wake it, whatever the policy says: the agent's own, an
+un-react, and anything in the backchannel, where a reaction is the principal
+annotating rather than asking.
 
 A reaction event in the inbox carries `key` and `target_event_id`. The
 message the session reads and answers is `target_event_id` - `event_id` is

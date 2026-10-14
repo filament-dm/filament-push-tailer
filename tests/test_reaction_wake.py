@@ -97,11 +97,11 @@ class TestReactionWakes:
         summary = _reaction(removed=True)
         assert push_tailer.skip_reason(summary, self.POLICY) == "unreact"
 
-    def test_the_processing_marker_never_wakes(self):
-        # POLICY lists it on purpose: the tailer adds this marker to every
-        # message it hands over, so honouring it would be an endless loop.
+    def test_a_listed_eyes_reaction_wakes(self):
+        # Nothing the agent posts is 👀, so a listed 👀 is a person's reaction
+        # like any other trigger.
         summary = _reaction("\N{EYES}")
-        assert push_tailer.skip_reason(summary, self.POLICY) == "processing_marker"
+        assert push_tailer.skip_reason(summary, self.POLICY) is None
 
     def test_the_backchannel_never_wakes(self, monkeypatch):
         # A reaction there is the principal annotating, not asking - and a
@@ -157,7 +157,6 @@ class TestDispatch:
         monkeypatch.setattr(push_tailer, "SEEN", str(tmp_path / "seen.json"))
         monkeypatch.setattr(push_tailer, "BACKCHANNEL_ROOM_ID", BACKCHANNEL)
         monkeypatch.setattr(push_tailer, "_seen", set())
-        monkeypatch.setattr(push_tailer, "_ack_eyes", lambda event_id: False)
         monkeypatch.setattr(
             push_tailer,
             "read_wake_policy",

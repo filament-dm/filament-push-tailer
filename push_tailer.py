@@ -89,16 +89,6 @@ UPDATE_NOTICE = os.path.join(STATE_DIR, "update_notice.json")
 UPDATE_CHECK_FIRST_S = 60
 UPDATE_CHECK_INTERVAL_S = 86400
 
-# Eyeballs ack. The agent session keeps SESSION_ALIVE freshly touched while it
-# is watching the inbox; while that file is fresh, the tailer posts the 👀
-# processing marker the moment a relevant message lands, instead of waiting for
-# the session to wake (several seconds of model latency). The session still
-# replies and clears the marker. Without a live session the tailer stays
-# silent, so 👀 keeps meaning "an agent is actually looking", not merely "the
-# push reached this machine".
-SESSION_ALIVE = os.path.join(STATE_DIR, "session-alive")
-SESSION_ALIVE_MAX_AGE_S = 20
-
 # One tailer per checkout. The PID file is how "is MY tailer running?" is
 # answered — a name match (pgrep -f) sees tailers from other clones/accounts
 # and lets a bootstrap skip starting the one that feeds THIS state dir,
@@ -328,12 +318,6 @@ def is_relevant(summary: dict) -> bool:
 
 # ---------------------------------------------------------------- reaction wake
 
-# The marker the tailer adds to a message it is handing to the session. Never
-# a wake trigger: a policy listing it would make the agent re-wake itself on
-# its own ack, without end.
-PROCESSING_REACTIONS = ("👀",)
-
-
 def read_wake_policy() -> dict:
     """Which emoji reactions wake the agent, read fresh per push so an edit
     takes effect without a restart.
@@ -387,14 +371,14 @@ def summarize_reaction(payload: dict) -> dict:
 def skip_reason(summary: dict, policy: dict) -> str | None:
     """Why this reaction does NOT wake the agent, or None if it does.
 
-    A wake needs an emoji the policy lists as a trigger for that room. Four
-    things override the list: the agent's own reaction, an un-react, the
-    processing marker, and the backchannel, where a reaction is the principal
-    annotating a message rather than asking for a turn.
+    A wake needs an emoji the policy lists as a trigger for that room. Three
+    things override the list: the agent's own reaction, an un-react, and the
+    backchannel, where a reaction is the principal annotating a message rather
+    than asking for a turn.
 
     The reason is what gets logged, so the configuration is checked FIRST:
     an emoji nobody listed did not wake for that reason, in any room. The
-    four overrides are reported only when they suppressed an emoji that was
+    three overrides are reported only when they suppressed an emoji that was
     a trigger - which makes each of them mean "your trigger was blocked
     because X", the one case where naming the override tells you something.
     """
@@ -404,8 +388,6 @@ def skip_reason(summary: dict, policy: dict) -> str | None:
         return "own_reaction"
     if summary.get("removed"):
         return "unreact"
-    if summary.get("key") in PROCESSING_REACTIONS:
-        return "processing_marker"
     if BACKCHANNEL_ROOM_ID and summary.get("room_id") == BACKCHANNEL_ROOM_ID:
         return "backchannel"
     return None
@@ -438,31 +420,6 @@ def write_mcp_config() -> None:
     }
     with open(MCP_CONFIG, "w") as f:
         json.dump(config, f, indent=2)
-
-
-def _session_is_live() -> bool:
-    try:
-        return (time.time() - os.path.getmtime(SESSION_ALIVE)) < SESSION_ALIVE_MAX_AGE_S
-    except OSError:
-        return False
-
-
-def _ack_eyes(event_id: str) -> bool:
-    """Post the 👀 marker for a message the session is about to handle.
-
-    Only when a live session is attached (see SESSION_ALIVE). Returns whether
-    the reaction was posted, so the inbox record can carry ``acked`` and the
-    session knows to skip its own react (it still unreacts after replying).
-    """
-    if not _session_is_live():
-        return False
-    try:
-        client.call_tool("react", {"message_id": event_id, "key": "👀"})
-        print(f"agent_listen: eyes ack on {event_id}")
-        return True
-    except Exception as e:  # noqa: BLE001 — the ack is best-effort
-        print(f"agent_listen: eyes ack failed: {e}")
-        return False
 
 
 def append_to_inbox(summary: dict) -> None:
@@ -499,11 +456,6 @@ def _handle_reaction(payload: dict, persistent_id) -> None:
         return
     _mark_seen(_seen, persistent_id)
     print(f"agent_listen: inbox <- reaction {summary['key']} in {where!r}")
-    # The marker goes on the message that was reacted to, not on the reaction:
-    # that message is what the session reads and answers, and what the person
-    # who reacted is watching.
-    if summary.get("target_event_id"):
-        summary["acked"] = _ack_eyes(summary["target_event_id"])
     try:
         append_to_inbox(summary)
     except Exception as e:  # noqa: BLE001 - one bad event must not kill the loop
@@ -555,8 +507,6 @@ def on_push(data, persistent_id, _obj=None) -> None:
     _mark_seen(_seen, persistent_id)
     where = summary["room_name"] or summary["room_id"]
     print(f"agent_listen: inbox <- {summary['branch_type']} in {where!r}")
-    if summary.get("event_id"):
-        summary["acked"] = _ack_eyes(summary["event_id"])
     try:
         append_to_inbox(summary)
     except Exception as e:  # noqa: BLE001 — one bad event must not kill the loop
