@@ -26,11 +26,21 @@ and never routed through the LLM.
 Config (env, or a .env beside this file; env wins):
   FILAMENT_CONNECT_TOKEN       your Filament MCP agent API key (the fmcp_
                                token; REQUIRED) — the agent's MCP bearer.
+                               `python push_tailer.py login` gets one by
+                               OAuth device sign-in and writes it here.
   FILAMENT_AGENT_API_BASE_URL  default https://api.filament.dm/mcp/agents;
                                override for other clusters.
   FILAMENT_FIREBASE_*          Firebase project config (public; defaults
                                baked in — same values as the other Filament
                                clients).
+
+Commands:
+  python push_tailer.py                    run the tailer
+  python push_tailer.py login [--no-wait | --resume] [--base-url URL]
+                                           sign in by OAuth device flow
+  python push_tailer.py mcp-add NAME [--run]
+                                           the `claude mcp add` command for
+                                           this token, without showing it
 
 Dependency:  pip install firebase-messaging
 State:  state/fcm-credentials.json (FCM creds), state/seen.json (dedup),
@@ -38,14 +48,18 @@ State:  state/fcm-credentials.json (FCM creds), state/seen.json (dedup),
         state/mcp.json (the Filament MCP server config for your session),
         state/inbox.jsonl (the append-only event feed your session tails),
         state/tailer.pid (this checkout's tailer — one per state dir),
-        state/update_notice.json (which sidecar version was announced).
+        state/update_notice.json (which sidecar version was announced),
+        state/device_login.json + .lock + login.log (a pending sign-in).
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -53,7 +67,10 @@ import time
 import urllib.error
 import urllib.request
 
+import device_login
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE = os.path.join(ROOT, ".env")
 STATE_DIR = os.path.join(ROOT, "state")
 CREDS = os.path.join(STATE_DIR, "fcm-credentials.json")
 SEEN = os.path.join(STATE_DIR, "seen.json")
@@ -115,9 +132,8 @@ def env(key: str, default: str | None = None, required: bool = False) -> str:
 
 def _load_dotenv() -> None:
     """Load a .env beside this file. Real env vars always win."""
-    path = os.path.join(ROOT, ".env")
     try:
-        lines = open(path).read().splitlines()
+        lines = open(ENV_FILE).read().splitlines()
     except OSError:
         return
     for line in lines:
@@ -129,12 +145,30 @@ def _load_dotenv() -> None:
         os.environ.setdefault(key, value)
 
 
+# Whether the token comes from the real environment, where it beats .env — so
+# `login` can warn that the token it just wrote to .env won't be used.
+_TOKEN_FROM_ENV = bool(os.environ.get("FILAMENT_CONNECT_TOKEN"))
 _load_dotenv()
 
-CONNECT_TOKEN = env("FILAMENT_CONNECT_TOKEN", required=True)
-API_BASE_URL = env(
-    "FILAMENT_AGENT_API_BASE_URL", "https://api.filament.dm/mcp/agents"
-).rstrip("/")
+DEFAULT_API_BASE_URL = "https://api.filament.dm/mcp/agents"
+# Not required at import: `login` runs precisely when there is no token yet.
+# The run checks for it in main() and says how to get one.
+CONNECT_TOKEN = env("FILAMENT_CONNECT_TOKEN")
+API_BASE_URL = env("FILAMENT_AGENT_API_BASE_URL", DEFAULT_API_BASE_URL).rstrip("/")
+
+
+def token_missing(token: str) -> bool:
+    """No token, or the .env.example placeholder copied over unfilled."""
+    return not token or token in ("fmcp_...", "fmcp_…")
+
+
+MISSING_TOKEN_HINT = """\
+agent_listen: no FILAMENT_CONNECT_TOKEN — this tailer isn't signed in to Filament yet.
+
+  Sign in (no token to paste):  python push_tailer.py login
+  It prints a link; the owner opens it, approves, and the token is saved to .env.
+  An agent that can't wait in the foreground: python push_tailer.py login --no-wait
+"""
 
 
 def _firebase(key: str) -> str:
@@ -821,7 +855,247 @@ def _claim_pid_file() -> None:
             pass
 
 
-def main() -> None:
+# ---------------------------------------------------------------- login (OAuth device flow)
+
+LOGIN_STATE = os.path.join(STATE_DIR, "device_login.json")
+LOGIN_LOCK = os.path.join(STATE_DIR, "device_login.lock")
+LOGIN_LOG = os.path.join(STATE_DIR, "login.log")
+_TOKEN_RE = re.compile(r"fmcp_[A-Za-z0-9_\-]+")
+
+
+def _say(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _redact(text: str) -> str:
+    return _TOKEN_RE.sub("fmcp_<redacted>", text)
+
+
+def _env_file_value(key: str) -> str:
+    """*key* as .env has it NOW — read fresh, since another process (the
+    detached poller) may have written it after this one started."""
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                name, sep, value = line.partition("=")
+                if sep and name.strip() == key:
+                    return value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def _report_signed_in(base: str, token: str) -> int:
+    try:
+        me = FilamentClient(base, token).get_self()
+    except Exception as e:  # noqa: BLE001
+        _say(f"login: got a token, but get_self failed: {_redact(str(e))}")
+        return 1
+    name = me.get("display_name") or me.get("displayname") or me.get("name")
+    uid = me.get("user_id") or "?"
+    _say(f"Signed in as {name} ({uid})" if name else f"Signed in as {uid}")
+    _say(f"Token saved to {ENV_FILE} (FILAMENT_CONNECT_TOKEN). Start the tailer: python push_tailer.py")
+    if _TOKEN_FROM_ENV:
+        _say(
+            "login: note — FILAMENT_CONNECT_TOKEN is also set in your environment, "
+            "which wins over .env. Unset it so the tailer uses the new token."
+        )
+    return 0
+
+
+def _poll_and_finish(pending: dict, *, immediate: bool) -> int:
+    """Poll one saved sign-in to the end; on approval write .env."""
+    started = time.time()
+
+    def still_wanted() -> bool:
+        # A newer `login` replaces the saved code; a poller on the old one stops.
+        current = device_login.load_pending(LOGIN_STATE) or {}
+        return current.get("device_code") == pending.get("device_code")
+
+    try:
+        doc = device_login.poll(
+            pending,
+            immediate=immediate,
+            still_wanted=still_wanted,
+            on_wait=lambda m: _say(f"login: {_redact(m)}"),
+        )
+    except device_login.LoginSuperseded as e:
+        _say(f"login: {e}")
+        return 1
+    except device_login.LoginError as e:
+        status = (
+            "denied" if isinstance(e, device_login.LoginDenied)
+            else "expired" if isinstance(e, device_login.LoginExpired)
+            else "error"
+        )
+        pending.pop("device_code", None)
+        pending.update(status=status, message=str(e), finished_at=time.time())
+        device_login.save_pending(LOGIN_STATE, pending)
+        _say(f"login: {e}")
+        return 1
+    token = doc["access_token"]
+    device_login.set_env_var(ENV_FILE, "FILAMENT_CONNECT_TOKEN", token)
+    if pending.get("write_base_url"):
+        device_login.set_env_var(ENV_FILE, "FILAMENT_AGENT_API_BASE_URL", pending["base_url"])
+    pending.pop("device_code", None)  # spent; the token is the secret now
+    pending.update(
+        status="approved",
+        agent_user_id=doc.get("agent_user_id"),
+        principal_user_id=doc.get("principal_user_id"),
+        finished_at=time.time(),
+    )
+    device_login.save_pending(LOGIN_STATE, pending)
+    _say(f"login: approved after {time.time() - started:.1f}s of polling")
+    return _report_signed_in(pending["base_url"], token)
+
+
+def _finish_saved() -> int:
+    """Report or continue whatever sign-in state/ holds. Caller holds the lock."""
+    pending = device_login.load_pending(LOGIN_STATE)
+    if not pending:
+        _say("login: no sign-in in progress. Run: python push_tailer.py login")
+        return 1
+    status = pending.get("status")
+    if status == "approved":
+        token = _env_file_value("FILAMENT_CONNECT_TOKEN")
+        if token_missing(token):
+            _say("login: the sign-in was approved but .env has no token. Run login again.")
+            return 1
+        return _report_signed_in(pending["base_url"], token)
+    if status != "pending" or not pending.get("device_code"):
+        _say(f"login: the last sign-in ended: {pending.get('message') or status}. Run login again.")
+        return 1
+    _say(f"login: waiting for approval of {pending['link']}")
+    return _poll_and_finish(pending, immediate=True)
+
+
+def _login_resume() -> int:
+    with device_login.poll_lock(LOGIN_LOCK, block=False) as got:
+        if got:
+            return _finish_saved()
+    holder = device_login.lock_holder(LOGIN_LOCK)
+    _say(f"login: another poller (pid {holder}) is waiting on this sign-in; waiting for it…")
+    with device_login.poll_lock(LOGIN_LOCK, block=True):
+        return _finish_saved()
+
+
+def _spawn_poller() -> int:
+    """`login --resume` in its own session, so it outlives this process, the
+    terminal and the harness turn that started it."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOGIN_LOG, "a") as log:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "login", "--resume"],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+    return proc.pid
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    if args.resume:
+        return _login_resume()
+    base = (args.base_url or API_BASE_URL).rstrip("/")
+    try:
+        pending = device_login.begin(base, args.client_name)
+    except device_login.LoginError as e:
+        _say(f"login: {e}")
+        return 1
+    pending["write_base_url"] = bool(args.base_url)
+    device_login.save_pending(LOGIN_STATE, pending)
+    minutes = max(1, round((pending["expires_at"] - time.time()) / 60))
+    _say(f"Open this link to approve: {pending['link']}")
+    _say(f"(It asks the owner to sign in to Filament; code {pending['user_code']}; expires in {minutes} min.)")
+    if args.no_wait:
+        pid = _spawn_poller()
+        _say(
+            f"login: a background poller (pid {pid}) saves the token to .env once "
+            f"approved (log: {LOGIN_LOG}). Check or wait with: python push_tailer.py login --resume"
+        )
+        return 0
+    with device_login.poll_lock(LOGIN_LOCK, block=True):
+        return _poll_and_finish(pending, immediate=False)
+
+
+# ---------------------------------------------------------------- mcp-add
+
+def mcp_add_command(name: str, base: str, scope: str = "local") -> str:
+    """The `claude mcp add` line, with the token read from .env by the shell
+    when it runs — so the line itself never shows the token."""
+    read_token = f"$(sed -n 's/^FILAMENT_CONNECT_TOKEN=//p' {shlex.quote(ENV_FILE)})"
+    return (
+        f"claude mcp add --scope {shlex.quote(scope)} --transport http "
+        f"{shlex.quote(name)} {shlex.quote(base)} "
+        f'--header "Authorization: Bearer {read_token}"'
+    )
+
+
+def cmd_mcp_add(args: argparse.Namespace) -> int:
+    token = _env_file_value("FILAMENT_CONNECT_TOKEN")
+    if token_missing(token):
+        _say(MISSING_TOKEN_HINT)
+        return 1
+    base = (args.base_url or _env_file_value("FILAMENT_AGENT_API_BASE_URL") or API_BASE_URL).rstrip("/")
+    if not args.run:
+        print(mcp_add_command(args.name, base, args.scope))
+        return 0
+    cmd = [
+        "claude", "mcp", "add", "--scope", args.scope, "--transport", "http",
+        args.name, base, "--header", f"Authorization: Bearer {token}",
+    ]
+    _say("Running: " + _redact(shlex.join(cmd)))
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        _say("mcp-add: `claude` is not on PATH")
+        return 127
+    for stream in (done.stdout, done.stderr):  # it may echo the header back
+        if stream:
+            _say(_redact(stream.rstrip()))
+    return done.returncode
+
+
+# ---------------------------------------------------------------- main
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="push_tailer.py",
+        description="Register for Filament pushes and tail them to state/inbox.jsonl.",
+    )
+    sub = parser.add_subparsers(dest="command")
+    login = sub.add_parser("login", help="sign in to Filament (OAuth device flow); saves the token to .env")
+    login.add_argument("--base-url", help=f"agent API base URL (default: FILAMENT_AGENT_API_BASE_URL or {DEFAULT_API_BASE_URL}); saved to .env")
+    login.add_argument("--client-name", default=device_login.DEFAULT_CLIENT_NAME,
+                       help="OAuth client name; it decides the agent type (default: %(default)r)")
+    mode = login.add_mutually_exclusive_group()
+    mode.add_argument("--no-wait", action="store_true",
+                      help="print the link, leave a background poller to save the token, exit")
+    mode.add_argument("--resume", action="store_true",
+                      help="wait for (or report) the sign-in saved in state/")
+    add = sub.add_parser("mcp-add", help="print (or --run) the `claude mcp add` command for this token")
+    add.add_argument("name", nargs="?", default="filament")
+    add.add_argument("--run", action="store_true", help="run it instead of printing it")
+    add.add_argument("--scope", default="local")
+    add.add_argument("--base-url")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    if args.command == "login":
+        sys.exit(cmd_login(args))
+    if args.command == "mcp-add":
+        sys.exit(cmd_mcp_add(args))
+    if token_missing(CONNECT_TOKEN):
+        sys.exit(MISSING_TOKEN_HINT)
     _claim_pid_file()
     try:
         asyncio.run(run())

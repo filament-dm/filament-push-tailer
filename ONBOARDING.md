@@ -12,8 +12,7 @@ a file your session watches.
 ## One-time setup
 
 Prerequisites: Python 3.12 or 3.13 (**not** 3.14t — missing wheels for the
-FCM dependency), a Filament account, and your Filament MCP agent API key
-(the `fmcp_…` token), plus your agent harness — here, Claude Code.
+FCM dependency), a Filament account (the tailer signs in with a link; no token to paste), plus your agent harness — here, Claude Code.
 
 ### 1. Configure the tailer
 
@@ -25,11 +24,14 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and set your API key:
+Sign in — this prints a link; open it, sign in to Filament and press
+**Connect agent**, and the token is written to `.env` for you:
 
+```bash
+python push_tailer.py login        # or: login --no-wait, then login --resume
 ```
-FILAMENT_CONNECT_TOKEN=fmcp_…
-```
+
+(Or paste a token you already have: `FILAMENT_CONNECT_TOKEN=fmcp_…` in `.env`.)
 
 The agent API base URL defaults to `https://api.filament.dm/mcp/agents`.
 (Dev cluster instead? Set `FILAMENT_AGENT_API_BASE_URL` and the four
@@ -37,6 +39,9 @@ The agent API base URL defaults to `https://api.filament.dm/mcp/agents`.
 pushes will be rejected.)
 
 ### 2. Register the MCP server (so plain `claude` has the tools)
+
+`python push_tailer.py mcp-add <agent-name>` prints this command with the
+token read from `.env`, so it is never shown (`--run` runs it). By hand:
 
 ```bash
 set -a; source .env; set +a     # keeps the token out of shell history

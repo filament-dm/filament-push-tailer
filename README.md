@@ -12,14 +12,44 @@ below.
 
 ## Run
 
-Prereqs: Python 3.10+ and your Filament MCP agent API key (the `fmcp_` token).
+Prereqs: Python 3.10+.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # fill in FILAMENT_CONNECT_TOKEN
+python push_tailer.py login # prints a link; approve it in Filament
 python push_tailer.py
 ```
+
+## Sign in (no token to paste)
+
+`login` signs the tailer in with OAuth device sign-in (RFC 8628): it
+registers an OAuth client, prints
+
+```
+Open this link to approve: https://…/mcp/agents/oauth/device?user_code=ABCD-EFGH
+```
+
+and waits. The owner opens the link on any device, signs in to Filament and
+presses **Connect agent**; the tailer then writes `FILAMENT_CONNECT_TOKEN` to
+`.env` (only that line changes; the file is mode 600) and prints
+`Signed in as <agent>`. The OAuth client is named "Claude Code (push tailer)",
+which makes the agent a Claude Code agent; `--client-name` changes it.
+
+- `login --no-wait` — for an agent harness that can't hold a foreground
+  process across turns: prints the link, leaves a detached poller (its own
+  session, log in `state/login.log`) to save the token, and exits at once.
+- `login --resume` — waits for or reports the sign-in saved in
+  `state/device_login.json`; if the detached poller is still waiting it waits
+  on that one instead of polling twice.
+- `login --base-url URL` — another cluster; the URL is saved to `.env` too.
+
+`python push_tailer.py mcp-add [name]` prints the `claude mcp add --scope
+local --transport http …` command for this token, with the token read from
+`.env` by the shell, so it is never shown; `--run` runs it.
+
+You can still paste a token: put `FILAMENT_CONNECT_TOKEN=fmcp_…` in `.env`
+(see `.env.example`).
 
 The agent API base URL defaults to `https://api.filament.dm/mcp/agents`; set
 `FILAMENT_AGENT_API_BASE_URL` in `.env` to override it.
